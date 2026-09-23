@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>A playbook for using AI agents safely in data engineering · Firas Bouzazi</title>
-<meta name="description" content="Guardrails over intelligence: letting AI agents build data pipelines by composing pre-tested abstractions, bounded by a contract, with people holding the gates.">
+<meta name="description" content="How I'd let AI agents build data pipelines without trusting them too much: tested building blocks, a contract, and people reviewing the important steps.">
 <meta name="author" content="Firas Bouzazi">
 <meta property="og:title" content="A playbook for using AI agents safely in data engineering">
-<meta property="og:description" content="Guardrails over intelligence: the value is in the constraints, not the model.">
+<meta property="og:description" content="How I'd let AI agents build data pipelines without trusting them too much.">
 <meta property="og:type" content="article">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' font-family='monospace'>·</text></svg>">
 <script>
@@ -33,17 +33,15 @@
     <header class="post-head">
       <p class="meta">2026-09-23</p>
       <h1>A playbook for using AI agents safely in data engineering</h1>
-      <p class="dek">Guardrails over intelligence: the value is in the constraints, not the model.</p>
+      <p class="dek">How I'd let an agent build pipelines without trusting it too much.</p>
     </header>
 
     <div class="prose">
-      <p>There's a lot of noise right now about AI agents writing data pipelines. Most of what I see is a demo: someone hands a language model database access, it generates some Spark, and it works on the happy path. That's a party trick, not engineering, and I wouldn't run it in production.</p>
+      <p>There's a lot of noise right now about AI agents writing data pipelines. Most of what I see is a demo: someone hands a language model database access, it generates some Spark, and it works on the happy path. It's a nice demo, but I wouldn't run it in production.</p>
 
-      <p>This post is about the opposite approach. The interesting problem isn't making an agent smart enough to write a correct pipeline from scratch. It's shrinking the problem until the agent can't get it dangerously wrong. You do that with a fixed architecture, a catalog of pre-tested building blocks, a contract that bounds the task, and human gates at the points that matter. In one line:</p>
+      <p>This post is about the opposite approach. The interesting problem isn't making an agent smart enough to write a correct pipeline from scratch. It's making the problem small enough that the agent can't do much damage. For me that means a fixed architecture, a set of tested building blocks, a contract that describes exactly what to build, and people reviewing the important steps.</p>
 
-      <blockquote><strong>We don't make the agent smarter. We shrink the problem until it can't be dangerously wrong. Humans design the constraints, agents operate within them, humans hold the gates.</strong></blockquote>
-
-      <p>Everything below is an instance of that idea.</p>
+      <p>So basically: don't try to make the agent smarter, make its job smaller. People set the rules and check the important steps, and the agent works inside those rules. The rest of this post is how I'd set that up.</p>
 
       <h2>What gets decided up front</h2>
 
@@ -55,7 +53,7 @@
         <li><strong>The deployment path.</strong> Terraform and a CI pipeline, written by people, that validate, test, and promote between environments.</li>
       </ul>
 
-      <p>The agent is almost a detail. The tested abstractions and the enforced structure are the real product. The agent is just a fast, tireless way to wire them together from a spec.</p>
+      <p>Honestly, the agent is the least important part. The tested building blocks and the structure around them do most of the work. The agent just connects them faster than I would.</p>
 
       <h2>The raw zone</h2>
 
@@ -63,7 +61,7 @@
 
       <p>Two rules make a good raw zone: it's <strong>immutable and append-only</strong>, and it's <strong>partitioned by ingestion time</strong>.</p>
 
-      <p>Immutability is your replay backstop. If a transform has a bug, you re-derive every downstream table from untouched raw. Nothing is lost, and raw stays a byte-for-byte record of what the source actually sent. You never update or delete in raw; you only append.</p>
+      <p>Keeping raw immutable means you can always replay. If a transform has a bug, you re-derive every downstream table from untouched raw. Nothing is lost, and raw stays a byte-for-byte record of what the source actually sent. You never update or delete in raw; you only append.</p>
 
       <p>The subtler choice is partitioning by ingestion time (when <em>you received</em> the data) rather than event time (when it <em>happened</em> at the source):</p>
 
@@ -80,13 +78,13 @@
         <li><strong>Retention and tiering.</strong> Expiring or cold-tiering old data is a prefix rule, not a row-level delete.</li>
       </ul>
 
-      <p>What you carry downstream: <strong>re-partition by event date in silver</strong>, where the business timeline matters. An event that happened on Jan 14 but arrived on Jan 16 sits in <code>ingest_date=2026-01-16</code> in raw and in <code>event_date=2026-01-14</code> in silver. That's why silver partitions get updated after the fact, and why silver writes are merges rather than blind appends. Ingestion time below, event time above. Get that split right and you have a platform you can reprocess, instead of one you're afraid to touch.</p>
+      <p>What you carry downstream: <strong>re-partition by event date in silver</strong>, where the business timeline matters. An event that happened on Jan 14 but arrived on Jan 16 sits in <code>ingest_date=2026-01-16</code> in raw and in <code>event_date=2026-01-14</code> in silver. That's why silver partitions get updated after the fact, and why silver writes are merges rather than blind appends. So: ingestion time in raw, event time in silver. If you get this right, reprocessing is easy. If you don't, you end up scared to touch old data.</p>
 
-      <p>I'm spending time on this before the AI part on purpose. The agent is only safe if this architecture is already correct.</p>
+      <p>I'm spending time on this before getting to the AI part because if this layer is wrong, the agent can't fix it.</p>
 
       <h2>The abstraction layer</h2>
 
-      <p>Here's the move that makes agents safe. We don't let agents write Spark, with each one reinventing what a bronze-to-silver step looks like. Those steps are nearly identical across pipelines anyway: read a source, standardize it, apply changes in order, enforce quality, write a table. So we write that logic <strong>once</strong>, as tested classes, and register them in a catalog the agent draws from.</p>
+      <p>This is the part that actually makes agents safe. We don't let agents write Spark, with each one reinventing what a bronze-to-silver step looks like. Those steps are nearly identical across pipelines anyway: read a source, standardize it, apply changes in order, enforce quality, write a table. So we write that logic <strong>once</strong>, as tested classes, and register them in a catalog the agent draws from.</p>
 
 <pre><code>RawToBronze      # land + parse + capture rescued columns
 BronzeToSilver   # dedup, standardize, apply CDC/SCD
@@ -101,13 +99,13 @@ QualityGate      # nulls, ranges, uniqueness, referential</code></pre>
         <li><strong>Calls to tested abstractions.</strong> Correctness lives in <em>your</em> tested class. The agent picks the class and fills in the parameters. The abstraction is the test boundary.</li>
       </ul>
 
-      <p>So the agent's job shrinks from "write a correct pipeline" to "wire known-good blocks in the right order with the right parameters". What it produces is configuration, not logic. That's the whole argument in concrete form.</p>
+      <p>So the agent's job shrinks from "write a correct pipeline" to "wire known-good blocks in the right order with the right parameters". It ends up producing config, not logic. That's really the main point of this post.</p>
 
       <p>The silver cleansing you always end up needing (fixing nulls, bad formats, slowly changing dimension errors) is just another abstraction here, <code>QualityGate</code> or <code>Standardize</code>, configured by the contract and never improvised by the agent.</p>
 
       <h2>The contract</h2>
 
-      <p>The agent needs a bounded spec of what to build. That's the interface contract: a document a person writes, or at least reviews, describing the source, the target, and the rules. Everything downstream is derived from it, which is exactly why it's the safety boundary.</p>
+      <p>The agent needs a bounded spec of what to build. That's the interface contract: a document a person writes, or at least reviews, describing the source, the target, and the rules. Everything else is generated from it, so if the contract is right, most of what comes after is right too.</p>
 
 <pre><code>source:
   location: s3://raw/salesforce/orders/
@@ -134,7 +132,7 @@ quality:
         <li><strong>SCD (slowly changing dimension).</strong> How you handle an attribute that changes. <em>Type 1</em> overwrites and keeps only the current value. <em>Type 2</em> keeps history: a new row per change, with validity dates and a current flag. The contract says which; the abstraction implements it.</li>
       </ul>
 
-      <p>Notice the contract uses decimal for money and is explicit about keys and the sequence column. Those are exactly the details an agent would otherwise guess, and guess wrong.</p>
+      <p>Notice the contract uses decimal for money and is explicit about keys and the sequence column. If you leave those out, the agent will guess, and it'll often guess wrong.</p>
 
       <h2>How the agent finds the abstractions</h2>
 
@@ -145,15 +143,15 @@ quality:
       <p>Two properties make this safe:</p>
 
       <ul>
-        <li><strong>Closed vocabulary.</strong> The agent composes only from the catalog and can't invent a transform. If a contract needs something the catalog doesn't have, the agent escalates to a person instead of improvising. I see that as the point, not a limitation.</li>
+        <li><strong>Closed vocabulary.</strong> The agent composes only from the catalog and can't invent a transform. If a contract needs something the catalog doesn't have, the agent escalates to a person instead of improvising. That's on purpose.</li>
         <li><strong>Validation before generation.</strong> The plan is checked against each abstraction's preconditions before any code or Terraform is written, so a bad wiring is caught structurally rather than at runtime.</li>
       </ul>
 
-      <p>If you've built agentic systems, this is the familiar tool-use pattern: you aren't asking the model to be creative, you're asking it to pick correctly from a vetted menu. The part I'd underline is that <strong>the catalog's descriptions are a maintained part of the platform</strong>, just as much as the code they point to. If a description is vague, the agent's choices will be too.</p>
+      <p>If you've built agentic systems, this is the familiar tool-use pattern: you aren't asking the model to be creative, you're asking it to pick correctly from a vetted menu. One thing that's easy to forget: <strong>the descriptions in the catalog need to be maintained like code</strong>. If a description is vague, the agent's choices will be vague too.</p>
 
       <h2>Where the humans stand</h2>
 
-      <p>The agent proposes; the pipeline and the people decide. Concretely, with an agentic workflow (say a Claude agent that has the abstraction catalog as its tools and opens pull requests instead of committing to main), the gates sit here:</p>
+      <p>The agent suggests things; people and CI decide. Concretely, with an agentic workflow (say a Claude agent that has the abstraction catalog as its tools and opens pull requests instead of committing to main), the gates sit here:</p>
 
       <ul>
         <li><strong>Contract review.</strong> A person writes or approves the contract before anything runs. An agent can draft one from a business description, but a person signs off, because business intent is the one thing the agent must never assume.</li>
@@ -163,7 +161,7 @@ quality:
         <li><strong>DAG checks.</strong> The agent generates orchestration jobs from an orchestration contract, and a person runs DAG unit tests (the kind <a href="https://www.astronomer.io/docs/learn/testing-airflow">Astronomer documents for Airflow</a>) to make sure no job went missing.</li>
       </ul>
 
-      <p>Each gate is there to catch something specific. That's what makes them designed rather than decorative.</p>
+      <p>Each of these checks catches a specific kind of mistake. They're not there just to have a review step.</p>
 
       <p>Here's the split of work in one place:</p>
 
@@ -187,19 +185,19 @@ quality:
 
       <h2>A failure that gets through</h2>
 
-      <p>Guardrails leak, and a post like this should say how. Here's the kind of failure that slips past everything above.</p>
+      <p>None of this is bulletproof. Here's an example of something that could still get through.</p>
 
       <p>Picture a contract for a <code>customers</code> source that lists twelve columns. The source recently gained a thirteenth, <code>loyalty_tier</code>, and nobody updated the contract. The agent generates a perfectly valid pipeline: right abstractions, schema validation passes (the contract is internally consistent), tests pass (they only check the columns the contract declares). It runs green for three weeks. The problem surfaces when an analyst asks why loyalty segmentation is empty.</p>
 
       <p>The agent didn't do anything wrong. It built exactly what the contract said. The gap is that <strong>nothing checked the contract against the real source schema.</strong></p>
 
-      <p>The fix is another guardrail: a schema drift check that compares the live source schema to the contract at ingestion and flags differences for review, plus rescued-column capture in bronze so an undeclared field is never silently dropped. The agent is only as safe as the contract is faithful to reality, and checking that is a guardrail you have to build yourself. A smarter model wouldn't have caught this. A system-level check does.</p>
+      <p>The fix is another guardrail: a schema drift check that compares the live source schema to the contract at ingestion and flags differences for review, plus rescued-column capture in bronze so an undeclared field is never silently dropped. The agent can only be as good as the contract, so you need something that checks the contract against the real data. A better model wouldn't fix this. A simple schema check would.</p>
 
       <h2>Deployment and cost</h2>
 
-      <p>The approval is the trigger; the CI pipeline, written by people, is the enforcement. Once someone approves the PR, CI runs the tests, shows the Terraform <code>plan</code> before any <code>apply</code>, and promotes across environments. The things you'd worry about with autonomous generation are handled by deterministic machinery that people own, not by the agent's judgment.</p>
+      <p>A person approving the PR just starts things. The actual checks happen in CI, which people wrote. Once someone approves, CI runs the tests, shows the Terraform <code>plan</code> before any <code>apply</code>, and promotes across environments. So the risky parts don't depend on the agent making good calls.</p>
 
-      <p>Cost needs its own guardrail. When pipelines are cheap to generate, "easy to generate" quietly turns into "easy to overspend". Put cost controls in the same CI path: cluster size limits through policy, and a cost estimate shown on the Terraform plan so the reviewer sees the bill before approving.</p>
+      <p>Cost needs its own check. When pipelines are this easy to create, it's also easy to end up with a big bill. Put cost controls in the same CI path: cluster size limits through policy, and a cost estimate shown on the Terraform plan so the reviewer sees the bill before approving.</p>
 
       <h2>When not to use this</h2>
 
@@ -211,15 +209,13 @@ quality:
         <li><strong>New logic with no safe abstraction.</strong> That's why the <strong>gold layer stays human-written</strong>, with a coding assistant at most. Gold is where business logic lives. Every mart is different, so there's no repeated pattern to constrain against, the cost of a subtle mistake is highest, and there's no tested abstraction to hold the agent to.</li>
       </ul>
 
-      <p>The general rule: agents pay off where the pattern repeats and a tested abstraction exists. People own the new, the one-off, and the not-yet-understood.</p>
+      <p>The general rule: agents pay off where the pattern repeats and a tested abstraction exists. Anything new, one-off, or not well understood yet, a person should write.</p>
 
       <h2>The takeaway</h2>
 
-      <p>None of this works because of a clever prompt or a smarter model. It works because the hard parts are engineered away before the agent ever runs: the raw zone is built for idempotency and replay, the transformation logic lives in tested abstractions, the task is bounded by a contract, the agent picks from a closed vocabulary, and people hold the gates where judgment matters. The agent works inside a box built so that the worst it can do gets caught.</p>
+      <p>To sum up: this doesn't depend on a good prompt or a smarter model. It works because most of the hard decisions are made before the agent runs. The raw zone is set up so you can replay safely, the logic lives in tested building blocks, the contract says exactly what to build, the agent can only pick from a fixed list, and people review the steps that need judgment. So when the agent gets something wrong, it gets caught.</p>
 
-      <p>The tools will change. The principle is the part I'd keep:</p>
-
-      <blockquote><strong>Humans design the constraints, agents operate within them, humans hold the gates.</strong></blockquote>
+      <p>The tools will probably change a lot. I think the idea still holds: people set the rules and check the important steps, and the agent does the repetitive wiring.</p>
     </div>
 
     <a class="back" href="/">Back home</a>
