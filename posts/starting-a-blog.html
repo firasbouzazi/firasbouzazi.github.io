@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Starting a blog · Firas Bouzazi</title>
+<meta name="description" content="Why I'm keeping notes in public, and how this little site is built.">
+<meta name="author" content="Firas Bouzazi">
+<meta property="og:title" content="Starting a blog">
+<meta property="og:description" content="Why I'm keeping notes in public, and how this little site is built.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' font-family='monospace'>·</text></svg>">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site-head">
+  <a class="home" href="/">firas bouzazi</a>
+  <button class="theme-toggle" type="button" aria-label="Toggle color theme">theme</button>
+</header>
+
+<main class="wrap">
+  <article class="post">
+
+    <header class="post-head">
+      <p class="meta">2026-09-23</p>
+      <h1>Starting a blog</h1>
+    </header>
+
+    <div class="prose">
+      <p>I studied computer science and I'm curious about most of tech. Right now a lot of my work is building data platforms: moving data from where it happens to where it can be understood, into tables people trust. Along the way I collect small lessons that never quite fit into a commit message. This is where they go.</p>
+
+      <p>No grand plan. Just notes I'd have wanted to read earlier: the failure that took an afternoon to diagnose, the design decision that aged well, the tool that was quietly better than its reputation.</p>
+
+      <h2>How this is built</h2>
+
+      <p>The whole site is a handful of static files. There is no framework, no build step, no analytics, and nothing to track you. A page is HTML; the styling lives in one small stylesheet; a few lines of JavaScript remember whether you prefer light or dark.</p>
+
+      <p>Writing a new post means copying a template and filling in the prose. That's deliberate. The friction of a build pipeline is exactly the friction that keeps a blog empty.</p>
+
+      <blockquote>The best system for writing is the one that lets you write without thinking about the system.</blockquote>
+
+      <h2>What to expect</h2>
+
+      <ul>
+        <li>Streaming systems: Kafka, Flink, change data capture, and the sharp edges between them.</li>
+        <li>Lakehouse platforms: table formats, layout, and keeping query cost honest.</li>
+        <li>The unglamorous parts: backfills, schema evolution, and the quiet art of not losing data.</li>
+      </ul>
+
+      <p>If any of that is your world too, welcome. If you want to talk shop, the links at the bottom of every page reach me.</p>
+    </div>
+
+    <a class="back" href="/">Back home</a>
+
+  </article>
+</main>
+
+<footer class="site-foot">
+  <span>Firas Bouzazi</span>
+  <span class="spacer"></span>
+  <a href="https://github.com/firasbouzazi">GitHub</a>
+  <a href="https://www.linkedin.com/in/firas-bouzazi/">LinkedIn</a>
+  <a href="mailto:firas.bouzazi@imt-atlantique.net">Email</a>
+</footer>
+
+<script src="../theme.js"></script>
+</body>
+</html>
