@@ -195,6 +195,59 @@ steps:
 
       <p>Here's the whole thing in order, using the <code>orders</code> table from above.</p>
 
+      <figure class="diagram">
+        <svg viewBox="0 0 380 608" role="img" aria-labelledby="flow-title">
+          <title id="flow-title">Flow of one pipeline: a person makes the request, the agent drafts the contract, a person signs off, the agent writes the plan, automated checks validate it, a person reviews it, the agent generates config and opens a PR, CI runs tests and a cost check, a person approves, it deploys, and then it runs hourly.</title>
+          <defs><marker id="flow-ah" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker></defs>
+          <line class="lane-line" x1="144" y1="6" x2="144" y2="604"/>
+          <line class="lane-line" x1="260" y1="6" x2="260" y2="604"/>
+          <text class="lane-title" x="86" y="20">PERSON</text>
+          <text class="lane-title" x="202" y="20">AGENT</text>
+          <text class="lane-title" x="318" y="20">AUTOMATED</text>
+          <path class="edge" d="M86 78 V87 H202 V96" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M202 130 V139 H86 V148" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M86 182 V191 H202 V200" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M202 234 V243 H318 V252" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M318 286 V295 H86 V304" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M86 338 V347 H202 V356" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M202 390 V399 H318 V408" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M318 442 V451 H86 V460" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M86 494 V503 H318 V512" marker-end="url(#flow-ah)"/>
+          <path class="edge" d="M318 546 V564" marker-end="url(#flow-ah)"/>
+          <rect class="box person" x="34" y="44" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="61.0">1</text>
+          <text class="label" x="86" y="61.0">Request</text>
+          <rect class="box agent" x="150" y="96" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="113.0">2</text>
+          <text class="label" x="202" y="113.0"><tspan x="202" dy="-0.6em">Draft</tspan><tspan x="202" dy="1.2em">contract</tspan></text>
+          <rect class="box person" x="34" y="148" width="104" height="34" rx="3"/>
+          <text class="label" x="86" y="165.0"><tspan x="86" dy="-0.6em">Sign off</tspan><tspan x="86" dy="1.2em">contract</tspan></text>
+          <rect class="box agent" x="150" y="200" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="217.0">3</text>
+          <text class="label" x="202" y="217.0">Write plan</text>
+          <rect class="box auto" x="266" y="252" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="269.0">4</text>
+          <text class="label" x="318" y="269.0"><tspan x="318" dy="-0.6em">Validate</tspan><tspan x="318" dy="1.2em">plan</tspan></text>
+          <rect class="box person" x="34" y="304" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="321.0">5</text>
+          <text class="label" x="86" y="321.0">Review plan</text>
+          <rect class="box agent" x="150" y="356" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="373.0">6</text>
+          <text class="label" x="202" y="373.0"><tspan x="202" dy="-0.6em">Generate</tspan><tspan x="202" dy="1.2em">config + PR</tspan></text>
+          <rect class="box auto" x="266" y="408" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="425.0">7</text>
+          <text class="label" x="318" y="425.0"><tspan x="318" dy="-0.6em">Tests +</tspan><tspan x="318" dy="1.2em">cost check</tspan></text>
+          <rect class="box person" x="34" y="460" width="104" height="34" rx="3"/>
+          <text class="label" x="86" y="477.0">Approve PR</text>
+          <rect class="box auto" x="266" y="512" width="104" height="34" rx="3"/>
+          <text class="label" x="318" y="529.0">Deploy</text>
+          <rect class="box auto" x="266" y="564" width="104" height="34" rx="3"/>
+          <text class="num" x="8" y="581.0">8</text>
+          <text class="label" x="318" y="581.0">Run hourly</text>
+          </svg>
+        <figcaption>Who does each step. The numbers match the list below.</figcaption>
+      </figure>
+
       <ol>
         <li><strong>The request.</strong> Someone on the finance side needs order history in silver, including how an order's status changed over time. At this point it's a business need, not a spec.</li>
         <li><strong>The contract.</strong> The agent drafts the contract from that request: <code>order_id</code> as the key, <code>updated_at</code> to order changes, SCD type 2 because they want history, decimal for amounts, an hourly schedule. A person reads it and signs off. This is where business intent gets pinned down, so it's never skipped.</li>
