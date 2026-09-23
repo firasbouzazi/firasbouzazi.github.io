@@ -308,6 +308,38 @@ figcaption {
 .back:hover { color: var(--fg); }
 .back::before { content: "\2190\00a0"; }
 
+/* Subtitle under a post title */
+.post-head .dek {
+  margin: .9rem 0 0;
+  color: var(--muted);
+  font-size: 1.1rem;
+  font-style: italic;
+  line-height: 1.45;
+}
+
+/* Tables */
+.table-wrap { overflow-x: auto; }
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .9rem;
+  line-height: 1.5;
+}
+.prose th, .prose td {
+  text-align: left;
+  vertical-align: top;
+  padding: .65rem 1rem .65rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+.prose th {
+  font-family: var(--mono);
+  font-size: .7rem;
+  font-weight: 400;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
 @media (max-width: 480px) {
   body { font-size: 18px; }
 }
