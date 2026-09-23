@@ -129,9 +129,25 @@ quality:
       <p>Two terms in there drive the choice of abstractions:</p>
 
       <ul>
-        <li><strong>CDC (change data capture).</strong> The source emits row-level inserts, updates, and deletes instead of full snapshots. The <code>sequence_by</code> column orders those changes, so an older event that arrives late never overwrites a newer one.</li>
+        <li><strong>CDC (change data capture).</strong> The source emits row-level inserts, updates, and deletes instead of full snapshots. The <code>sequence_by</code> column orders those changes, so an older event that arrives late never overwrites a newer one. Most CDC feeds come from reading the database's transaction log (<a href="https://debezium.io/documentation/">Debezium</a> is the usual open source tool), so each change arrives with the operation, the row's values, and its position in the log. If you have that log position, it's a safer <code>sequence_by</code> than a timestamp, since two updates can land in the same millisecond.</li>
         <li><strong>SCD (slowly changing dimension).</strong> How you handle an attribute that changes. <em>Type 1</em> overwrites and keeps only the current value. <em>Type 2</em> keeps history: a new row per change, with validity dates and a current flag. The contract says which; the abstraction implements it.</li>
       </ul>
+
+      <p>Here's what type 2 looks like in practice. Say order <code>A1</code> goes from <code>new</code> to <code>paid</code>. The old row isn't overwritten. It gets closed (<code>valid_to</code> is set, <code>is_current</code> flips to false) and a new current row is added:</p>
+
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr><th>order_id</th><th>status</th><th>valid_from</th><th>valid_to</th><th>is_current</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>A1</td><td>new</td><td>2026-01-10 09:00</td><td>2026-01-11 14:30</td><td>false</td></tr>
+            <tr><td>A1</td><td>paid</td><td>2026-01-11 14:30</td><td>null</td><td>true</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The current state is a filter on <code>is_current</code>. "What was the status on Jan 10?" is a filter on the validity range. A delete in the source usually just closes the current row, so the history stays. It's also why the quality rule checks uniqueness on current rows only: there's one current row per order, but many rows in total.</p>
 
       <p>Notice the contract uses decimal for money and is explicit about keys and the sequence column. If you leave those out, the agent will guess, and it'll often guess wrong.</p>
 
@@ -168,6 +184,8 @@ steps:
       </ul>
 
       <p>If you've built agentic systems, this is the familiar tool-use pattern: you aren't asking the model to be creative, you're asking it to pick correctly from a vetted menu. One thing that's easy to forget: <strong>the descriptions in the catalog need to be maintained like code</strong>. If a description is vague, the agent's choices will be vague too.</p>
+
+      <p>Anthropic's post on <a href="https://www.anthropic.com/engineering/building-effective-agents">building effective agents</a> has a useful distinction here. It separates <em>workflows</em>, where the model and its tools run along predefined code paths, from agents that decide their own process. What I'm describing is closer to a workflow, on purpose: the path is fixed and the model fills in the steps. The same post suggests putting as much effort into the agent-computer interface, meaning the tools and their docs, as you would into a user interface. For this setup, that interface is the catalog.</p>
 
       <h2>Where the humans stand</h2>
 
@@ -247,6 +265,37 @@ steps:
       <p>To sum up: this doesn't depend on a good prompt or a smarter model. It works because most of the hard decisions are made before the agent runs. The raw zone is set up so you can replay safely, the logic lives in tested building blocks, the contract says exactly what to build, the agent can only pick from a fixed list, and people review the steps that need judgment. So when the agent gets something wrong, it gets caught.</p>
 
       <p>The tools will probably change a lot. I think the idea still holds: people set the rules and check the important steps, and the agent does the repetitive wiring.</p>
+
+      <hr>
+
+      <h3>Sources and further reading</h3>
+
+      <p><strong>Agentic design</strong></p>
+      <ul>
+        <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">Building effective agents</a>. Workflows vs agents, and why tool design matters as much as the prompt.</li>
+        <li>Anthropic, <a href="https://www.anthropic.com/engineering/writing-tools-for-agents">Writing effective tools for agents</a>. How to name, scope, and describe tools so a model picks the right one.</li>
+        <li><a href="https://modelcontextprotocol.io/">Model Context Protocol</a>. An open standard for exposing tools to models, one way to publish a catalog like the one above.</li>
+      </ul>
+
+      <p><strong>Change data capture</strong></p>
+      <ul>
+        <li><a href="https://debezium.io/documentation/">Debezium documentation</a>. Log-based CDC for Postgres, MySQL, and others.</li>
+        <li><a href="https://docs.delta.io/latest/delta-change-data-feed.html">Delta Lake change data feed</a>. CDC on the lakehouse side, between your own tables.</li>
+        <li>Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, chapter 11. The section on change data capture explains why the log is the source of truth.</li>
+      </ul>
+
+      <p><strong>Slowly changing dimensions and modeling</strong></p>
+      <ul>
+        <li>Ralph Kimball and Margy Ross, <em>The Data Warehouse Toolkit</em>. Where the SCD types come from.</li>
+        <li>Kimball Group, <a href="https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/">Dimensional modeling techniques</a>. Short reference pages for SCD types 0 to 7.</li>
+        <li>Databricks, <a href="https://www.databricks.com/glossary/medallion-architecture">Medallion architecture</a>. The bronze / silver / gold layering.</li>
+      </ul>
+
+      <p><strong>Orchestration</strong></p>
+      <ul>
+        <li>Apache Airflow, <a href="https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html">Best practices</a>, including how to test DAGs.</li>
+        <li>Astronomer, <a href="https://www.astronomer.io/docs/learn/testing-airflow">Testing Airflow DAGs</a>.</li>
+      </ul>
     </div>
 
     <a class="back" href="/">Back home</a>
