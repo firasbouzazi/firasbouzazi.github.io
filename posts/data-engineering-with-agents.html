@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data engineering with agents: a playbook · Firas Bouzazi</title>
+<meta name="description" content="How I'd let AI agents build data pipelines without trusting them too much: tested building blocks, a contract, and people reviewing the important steps.">
+<meta name="author" content="Firas Bouzazi">
+<meta property="og:title" content="Data engineering with agents: a playbook">
+<meta property="og:description" content="How I'd let AI agents build data pipelines without trusting them too much.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' font-family='monospace'>·</text></svg>">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site-head">
+  <a class="home" href="/">firas bouzazi</a>
+  <button class="theme-toggle" type="button" aria-label="Toggle color theme">theme</button>
+</header>
+
+<main class="wrap">
+  <article class="post">
+
+    <header class="post-head">
+      <p class="meta">2026-09-23</p>
+      <h1>Data engineering with agents: a playbook</h1>
+      <p class="dek">How I'd let an agent build pipelines without trusting it too much.</p>
+    </header>
+
+    <div class="prose">
+      <p>There's a lot of noise right now about AI agents writing data pipelines. Most of what I see is a demo: someone hands a language model database access, it generates some Spark, and it works on the happy path. It's a nice demo, but I wouldn't run it in production.</p>
+
+      <p>This post is about the opposite approach: don't try to make the agent smarter, make its job smaller. A fixed architecture, a set of tested building blocks, a contract that says exactly what to build, and people checking the steps that need judgment. The agent only works inside those rules.</p>
+
+      <p>I'll go through the pieces one by one, then follow a single table, <code>orders</code>, from the first request to production, so you can see how they fit together.</p>
+
+      <h2>What gets decided up front</h2>
+
+      <p>Before any agent runs, people decide the parts that must not vary:</p>
+
+      <ul>
+        <li><strong>The global architecture.</strong> A layered lakehouse: raw / bronze / silver / gold, or landing / bronze / curated. The names don't matter much, the discipline does. Each layer has a fixed contract about what it holds and how much you can trust it.</li>
+        <li><strong>The abstraction layer.</strong> A library of tested classes the agent composes, instead of raw Spark it makes up.</li>
+        <li><strong>The deployment path.</strong> CI and infrastructure code. People write it once and it works the same way for every pipeline, so I won't spend much time on it.</li>
+      </ul>
+
+      <p>The agent is what makes this worth doing. It can go from a contract to a working pipeline in minutes, and it's just as fast on the fiftieth table as on the first. But it's only safe to use because of the structure around it: the tested building blocks and the rules above. That structure is what most of this post is about.</p>
+
+      <h2>The raw zone</h2>
+
+      <p>The raw zone is where sloppy design hurts the most later, because every layer above it inherits its shape. It's also the part an agent should touch least, since the decisions here are architectural, not per pipeline. A person makes them once and the platform enforces them from then on.</p>
+
+      <p>Two rules make a good raw zone: it's <strong>immutable and append-only</strong>, and it's <strong>partitioned by ingestion time</strong>.</p>
+
+      <p>Keeping raw immutable means you can always replay. If a transform has a bug, you re-derive every downstream table from untouched raw. Nothing is lost, and raw stays a byte-for-byte record of what the source actually sent. You never update or delete in raw; you only append.</p>
+
+      <p>The subtler choice is partitioning by ingestion time (when <em>you received</em> the data) rather than event time (when it <em>happened</em> at the source):</p>
+
+<pre><code>raw/source=salesforce/dataset=orders/ingest_date=2026-01-15/hour=14/</code></pre>
+
+      <p>You control ingestion time, and it only moves forward. Event time doesn't. Events arrive late and out of order: a mobile client buffers offline for three days, then sends a batch with old timestamps. If raw were partitioned by event date, that batch would force you to reopen and rewrite old partitions, which is messy and not idempotent. Partitioned by ingestion date, "reprocess everything that landed on the 15th" is a clean prefix scan, and a re-run overwrites exactly one partition.</p>
+
+      <p>That one choice pays off in four places:</p>
+
+      <ul>
+        <li><strong>Idempotency.</strong> Reprocessing means replacing one partition, not rewriting the table. Write the partition atomically and a re-run produces the same result, so retrying after a failure is safe.</li>
+        <li><strong>Reprocessing.</strong> Found a bug in a transform? Overwrite only the affected ingestion-date partitions, replayed from raw.</li>
+        <li><strong>Backfills.</strong> Historical loads become a bounded date-range job, separate from the live pipeline, running the same code with a different window.</li>
+        <li><strong>Retention and tiering.</strong> Expiring or cold-tiering old data is a prefix rule, not a row-level delete.</li>
+      </ul>
+
+      <p>What you carry downstream: <strong>re-partition by event date in silver</strong>, where the business timeline matters. An event that happened on Jan 14 but arrived on Jan 16 sits in <code>ingest_date=2026-01-16</code> in raw and in <code>event_date=2026-01-14</code> in silver. That's why silver partitions get updated after the fact, and why silver writes are merges rather than blind appends. So: ingestion time in raw, event time in silver. If you get this right, reprocessing is easy. If you don't, you end up scared to touch old data.</p>
+
+      <p>I'm spending time on this before getting to the AI part because if this layer is wrong, the agent can't fix it.</p>
+
+      <h2>The abstraction layer</h2>
+
+      <p>This is the part that actually makes agents safe. We don't let agents write Spark, with each one reinventing what a bronze-to-silver step looks like. Those steps are nearly identical across pipelines anyway: read a source, standardize it, apply changes in order, enforce quality, write a table. So we write that logic <strong>once</strong>, as tested classes, and register them in a catalog the agent draws from.</p>
+
+<pre><code>RawToBronze   # land + parse + capture rescued columns
+Standardize   # cast types, rename, normalize formats
+ApplyCDC      # apply an ordered change feed, keep latest (SCD type 1)
+ApplySCD2     # apply an ordered change feed, keep history
+QualityGate   # nulls, ranges, uniqueness, referential</code></pre>
+
+      <p>Think about the level an agent could generate at:</p>
+
+      <ul>
+        <li><strong>Raw Spark.</strong> The agent can produce code that's subtly wrong, hard to maintain, and untested. Correctness lives in the agent's output, which isn't deterministic. Unsafe.</li>
+        <li><strong>Calls to tested abstractions.</strong> Correctness lives in <em>your</em> tested class. The agent picks the class and fills in the parameters. The abstraction is the test boundary.</li>
+      </ul>
+
+      <p>So the agent's job shrinks from "write a correct pipeline" to "wire known-good blocks in the right order with the right parameters". It ends up producing config, not logic. That's really the main point of this post.</p>
+
+      <p>The silver cleansing you always end up needing (fixing nulls, bad formats, slowly changing dimension errors) is just another abstraction here, <code>QualityGate</code> or <code>Standardize</code>, configured by the contract and never improvised by the agent.</p>
+
+      <h2>The contract</h2>
+
+      <p>The agent needs a bounded spec of what to build. That's the interface contract: a document a person writes, or at least reviews, describing the source, the target, and the rules. Everything else is generated from it, so if the contract is right, most of what comes after is right too.</p>
+
+<pre><code>source:
+  location: s3://raw/salesforce/orders/
+  format: json
+target:
+  table: catalog.silver.orders
+  primary_keys: [order_id]
+  sequence_by: updated_at      # orders change events
+  scd: type_2                  # keep history
+  cdc: true                    # source is a change feed
+schedule: "@hourly"            # also used to generate the DAG
+schema:
+  - {name: order_id,   type: string,  nullable: false}
+  - {name: amount,     type: decimal(18,2)}
+  - {name: status,     type: string,  allowed: [new, paid, cancelled]}
+  - {name: updated_at, type: timestamp}
+quality:
+  - not_null: [order_id, amount]
+  - unique_current: [order_id]   # one current row per order</code></pre>
+
+      <p>Two terms in there drive the choice of abstractions:</p>
+
+      <ul>
+        <li><strong>CDC (change data capture).</strong> The source emits row-level inserts, updates, and deletes instead of full snapshots. The <code>sequence_by</code> column orders those changes, so an older event that arrives late never overwrites a newer one. Most CDC feeds come from reading the database's transaction log (<a href="https://debezium.io/documentation/">Debezium</a> is the usual open source tool), so each change arrives with the operation, the row's values, and its position in the log. If you have that log position, it's a safer <code>sequence_by</code> than a timestamp, since two updates can land in the same millisecond.</li>
+        <li><strong>SCD (slowly changing dimension).</strong> How you handle an attribute that changes. <em>Type 1</em> overwrites and keeps only the current value. <em>Type 2</em> keeps history: a new row per change, with validity dates and a current flag. The contract says which; the abstraction implements it.</li>
+      </ul>
+
+      <p>Here's what type 2 looks like in practice. Say order <code>A1</code> goes from <code>new</code> to <code>paid</code>. The old row isn't overwritten. It gets closed (<code>valid_to</code> is set, <code>is_current</code> flips to false) and a new current row is added:</p>
+
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr><th>order_id</th><th>status</th><th>valid_from</th><th>valid_to</th><th>is_current</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>A1</td><td>new</td><td>2026-01-10 09:00</td><td>2026-01-11 14:30</td><td>false</td></tr>
+            <tr><td>A1</td><td>paid</td><td>2026-01-11 14:30</td><td>null</td><td>true</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The current state is a filter on <code>is_current</code>. "What was the status on Jan 10?" is a filter on the validity range. A delete in the source usually just closes the current row, so the history stays. It's also why the quality rule checks uniqueness on current rows only: there's one current row per order, but many rows in total.</p>
+
+      <p>Notice the contract uses decimal for money and is explicit about keys and the sequence column. If you leave those out, the agent will guess, and it'll often guess wrong.</p>
+
+      <h2>How the agent finds the abstractions</h2>
+
+      <p>The piece people tend to skip is how the agent knows which abstractions exist and when to use each one. My answer: expose every abstraction as a <strong>described, machine-readable capability</strong>, basically a typed tool definition, and require the agent to choose only from that catalog.</p>
+
+      <p>Each entry carries what the agent needs to choose well: a name, a one-line "use this when", typed parameters, and preconditions (<code>ApplySCD2</code> requires a <code>sequence_by</code> column, for example). The agent gets the contract plus the catalog and is asked for a <strong>plan</strong>: which abstractions, in what order, with which parameters. Not code.</p>
+
+      <p>For the <code>orders</code> contract, the plan looks something like this:</p>
+
+<pre><code>pipeline: silver_orders
+steps:
+  - use: RawToBronze
+    with: {source: s3://raw/salesforce/orders/, format: json}
+  - use: Standardize
+    with: {schema: contract.schema}
+  - use: QualityGate
+    with: {not_null: [order_id, amount]}
+  - use: ApplySCD2
+    with: {keys: [order_id], sequence_by: updated_at,
+           partition_by: date(updated_at),
+           target: catalog.silver.orders}
+  - use: QualityGate
+    with: {unique_current: [order_id]}</code></pre>
+
+      <p>That's all the agent produces at this stage. No Spark, no SQL. Each step names a block from the catalog and fills in parameters taken from the contract. Reviewing it means reading a dozen lines against the contract, not auditing a pipeline.</p>
+
+      <p>Two properties make this safe:</p>
+
+      <ul>
+        <li><strong>Closed vocabulary.</strong> The agent composes only from the catalog and can't invent a transform. If a contract needs something the catalog doesn't have, the agent escalates to a person instead of improvising. That's on purpose.</li>
+        <li><strong>Validation before generation.</strong> The plan is checked against each abstraction's preconditions before anything is generated, so a bad wiring is caught structurally rather than at runtime.</li>
+      </ul>
+
+      <p>If you've built agentic systems, this is the familiar tool-use pattern: you aren't asking the model to be creative, you're asking it to pick correctly from a vetted menu. One thing that's easy to forget: <strong>the descriptions in the catalog need to be maintained like code</strong>. If a description is vague, the agent's choices will be vague too.</p>
+
+      <p>Anthropic's post on <a href="https://www.anthropic.com/engineering/building-effective-agents">building effective agents</a> has a useful distinction here. It separates <em>workflows</em>, where the model and its tools run along predefined code paths, from agents that decide their own process. What I'm describing is closer to a workflow, on purpose: the path is fixed and the model fills in the steps. The same post suggests putting as much effort into the agent-computer interface, meaning the tools and their docs, as you would into a user interface. For this setup, that interface is the catalog.</p>
+
+      <h2>Where the humans stand</h2>
+
+      <p>The agent suggests things; people and CI decide. Concretely, with an agentic workflow (say a Claude agent that has the abstraction catalog as its tools and opens pull requests instead of committing to main), the gates sit here:</p>
+
+      <ul>
+        <li><strong>Contract review.</strong> A person writes or approves the contract before anything runs. An agent can draft one from a business description, but a person signs off, because business intent is the one thing the agent must never assume.</li>
+        <li><strong>Plan review.</strong> The agent proposes its plan and a person checks it: "you chose <code>ApplySCD2</code> keyed on <code>order_id</code>, sequenced by <code>updated_at</code>. Is that right?" This happens before any code exists.</li>
+        <li><strong>Diff review.</strong> The agent opens a PR with the generated config, and a person reviews the diff like any other change.</li>
+        <li><strong>Tests and approval before promotion.</strong> Tests run against the produced tables, and a person approves promotion between environments. This is where you catch an agent that dropped a table or skipped a rule.</li>
+        <li><strong>DAG checks.</strong> The agent also writes the Airflow DAG, using the schedule from the same contract, and a person runs DAG unit tests (the kind <a href="https://www.astronomer.io/docs/learn/testing-airflow">Astronomer documents for Airflow</a>) to make sure no task or dependency went missing.</li>
+      </ul>
+
+      <p>Each of these checks catches a specific kind of mistake. They're not there just to have a review step.</p>
+
+      <p>Here's the split of work in one place:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Layer / artifact</th><th>Who does what</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Raw zone design</td><td>Written by people, deterministic, fixed</td></tr>
+            <tr><td>Abstraction library</td><td>Written and tested by people</td></tr>
+            <tr><td>Contract</td><td>Written by a person, or drafted by the agent and approved by a person</td></tr>
+            <tr><td>Bronze to silver pipeline</td><td>Generated by the agent (config over tested blocks), reviewed by a person</td></tr>
+            <tr><td>Quality, SCD, CDC rules</td><td>Declared in the contract, implemented by abstractions</td></tr>
+            <tr><td>CI and deployment</td><td>Written by people once, same for every pipeline</td></tr>
+            <tr><td>DAGs / orchestration</td><td>Generated by the agent from the contract, unit-tested by a person</td></tr>
+            <tr><td>Gold layer</td><td>Written by people, with an assistant at most</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>One table, start to finish</h2>
+
+      <p>Here's the whole thing in order, using the <code>orders</code> table from above.</p>
+
+      <ol>
+        <li><strong>The request.</strong> Someone on the finance side needs order history in silver, including how an order's status changed over time. At this point it's a business need, not a spec.</li>
+        <li><strong>The contract.</strong> The agent drafts the contract from that request: <code>order_id</code> as the key, <code>updated_at</code> to order changes, SCD type 2 because they want history, decimal for amounts, an hourly schedule. A person reads it and signs off. This is where business intent gets pinned down, so it's never skipped.</li>
+        <li><strong>The plan.</strong> The agent reads the contract and the catalog and outputs the plan shown earlier. Still no code.</li>
+        <li><strong>Validation.</strong> The plan is checked automatically: every step is in the catalog, <code>ApplySCD2</code> has the <code>sequence_by</code> it needs, every column it mentions exists in the contract. A plan that fails here never reaches a person.</li>
+        <li><strong>Plan review.</strong> A person checks the choices: SCD2 keyed on <code>order_id</code>, ordered by <code>updated_at</code>, partitioned by event date. That takes a few minutes.</li>
+        <li><strong>Generation.</strong> The agent turns the plan into pipeline config plus an Airflow DAG and opens a PR. The config only points at tested classes; nothing is hand-written Spark.</li>
+        <li><strong>CI and deploy.</strong> CI runs the same way for every pipeline: tests against sample data, DAG unit tests, and a preview of the infrastructure change with a cost estimate. Cluster size is capped by policy, so a generated pipeline can't quietly ask for a huge cluster. A person approves the PR and CI promotes it from dev to prod.</li>
+        <li><strong>Running.</strong> Every hour the pipeline reads the newest <code>ingest_date</code> partitions from raw, applies changes in <code>updated_at</code> order, and merges into silver by event date. If a bug shows up in a block later, it gets fixed once and the affected ingestion dates are replayed from raw.</li>
+      </ol>
+
+      <p>The agent does three things here: drafts the contract (2), writes the plan (3), and generates the config (6). Those three are where most of the hands-on time used to go. Everything else is a person or code people wrote.</p>
+
+      <h2>A failure that gets through</h2>
+
+      <p>None of this is bulletproof. Here's an example of something that could still get through.</p>
+
+      <p>Picture a contract for a <code>customers</code> source that lists twelve columns. The source recently gained a thirteenth, <code>loyalty_tier</code>, and nobody updated the contract. The agent generates a perfectly valid pipeline: right abstractions, schema validation passes (the contract is internally consistent), tests pass (they only check the columns the contract declares). It runs green for three weeks. The problem surfaces when an analyst asks why loyalty segmentation is empty.</p>
+
+      <p>The agent didn't do anything wrong. It built exactly what the contract said. The gap is that <strong>nothing checked the contract against the real source schema.</strong></p>
+
+      <p>The fix is another guardrail: a schema drift check that compares the live source schema to the contract at ingestion and flags differences for review, plus rescued-column capture in bronze so an undeclared field is never silently dropped. The agent can only be as good as the contract, so you need something that checks the contract against the real data. A better model wouldn't fix this. A simple schema check would.</p>
+
+      <h2>When not to use this</h2>
+
+      <p>This isn't where you start. It pays off only where a pattern repeats <em>and</em> a tested abstraction for it already exists. So:</p>
+
+      <ul>
+        <li><strong>Young projects.</strong> Early on you don't know your patterns yet, you're still finding them. Building a catalog before you understand the shape of your pipelines is premature. Write pipelines by hand until the patterns settle, then extract abstractions, then let agents compose them.</li>
+        <li><strong>One-off pipelines.</strong> If it won't be repeated, there's no abstraction, and building one for a single use isn't worth it.</li>
+        <li><strong>New logic with no safe abstraction.</strong> That's why the <strong>gold layer stays human-written</strong>, with a coding assistant at most. Gold is where business logic lives. Every mart is different, so there's no repeated pattern to constrain against, the cost of a subtle mistake is highest, and there's no tested abstraction to hold the agent to.</li>
+      </ul>
+
+      <p>The general rule: agents pay off where the pattern repeats and a tested abstraction exists. Anything new, one-off, or not well understood yet, a person should write.</p>
+
+      <h2>The takeaway</h2>
+
+      <p>To sum up: this doesn't depend on a good prompt or a smarter model. It works because most of the hard decisions are made before the agent runs. The raw zone is set up so you can replay safely, the logic lives in tested building blocks, the contract says exactly what to build, the agent can only pick from a fixed list, and people review the steps that need judgment. So when the agent gets something wrong, it gets caught.</p>
+
+      <p>The tools will probably change a lot. I think the idea still holds: people set the rules and check the important steps, and the agent does the repetitive wiring.</p>
+
+      <hr>
+
+      <h3>Sources and further reading</h3>
+
+      <p><strong>Agentic design</strong></p>
+      <ul>
+        <li>Anthropic, <a href="https://www.anthropic.com/engineering/building-effective-agents">Building effective agents</a>. Workflows vs agents, and why tool design matters as much as the prompt.</li>
+        <li>Anthropic, <a href="https://www.anthropic.com/engineering/writing-tools-for-agents">Writing effective tools for agents</a>. How to name, scope, and describe tools so a model picks the right one.</li>
+        <li><a href="https://modelcontextprotocol.io/">Model Context Protocol</a>. An open standard for exposing tools to models, one way to publish a catalog like the one above.</li>
+      </ul>
+
+      <p><strong>Change data capture</strong></p>
+      <ul>
+        <li><a href="https://debezium.io/documentation/">Debezium documentation</a>. Log-based CDC for Postgres, MySQL, and others.</li>
+        <li><a href="https://docs.delta.io/latest/delta-change-data-feed.html">Delta Lake change data feed</a>. CDC on the lakehouse side, between your own tables.</li>
+        <li>Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, chapter 11. The section on change data capture explains why the log is the source of truth.</li>
+      </ul>
+
+      <p><strong>Slowly changing dimensions and modeling</strong></p>
+      <ul>
+        <li>Ralph Kimball and Margy Ross, <em>The Data Warehouse Toolkit</em>. Where the SCD types come from.</li>
+        <li>Kimball Group, <a href="https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/">Dimensional modeling techniques</a>. Short reference pages for SCD types 0 to 7.</li>
+        <li>Databricks, <a href="https://www.databricks.com/glossary/medallion-architecture">Medallion architecture</a>. The bronze / silver / gold layering.</li>
+      </ul>
+
+      <p><strong>Orchestration</strong></p>
+      <ul>
+        <li>Apache Airflow, <a href="https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html">Best practices</a>, including how to test DAGs.</li>
+        <li>Astronomer, <a href="https://www.astronomer.io/docs/learn/testing-airflow">Testing Airflow DAGs</a>.</li>
+      </ul>
+    </div>
+
+    <a class="back" href="/">Back home</a>
+
+  </article>
+</main>
+
+<footer class="site-foot">
+  <span>Firas Bouzazi</span>
+  <span class="spacer"></span>
+  <a href="https://github.com/firasbouzazi">GitHub</a>
+  <a href="https://www.linkedin.com/in/firas-bouzazi/">LinkedIn</a>
+  <a href="mailto:firas.bouzazi@imt-atlantique.net">Email</a>
+</footer>
+
+<script src="../theme.js"></script>
+</body>
+</html>
