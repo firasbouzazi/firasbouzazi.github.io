@@ -39,9 +39,9 @@
     <div class="prose">
       <p>There's a lot of noise right now about AI agents writing data pipelines. Most of what I see is a demo: someone hands a language model database access, it generates some Spark, and it works on the happy path. It's a nice demo, but I wouldn't run it in production.</p>
 
-      <p>This post is about the opposite approach. The interesting problem isn't making an agent smart enough to write a correct pipeline from scratch. It's making the problem small enough that the agent can't do much damage. For me that means a fixed architecture, a set of tested building blocks, a contract that describes exactly what to build, and people reviewing the important steps.</p>
+      <p>This post is about the opposite approach: don't try to make the agent smarter, make its job smaller. A fixed architecture, a set of tested building blocks, a contract that says exactly what to build, and people checking the steps that need judgment. The agent only works inside those rules.</p>
 
-      <p>So basically: don't try to make the agent smarter, make its job smaller. People set the rules and check the important steps, and the agent works inside those rules. The rest of this post is how I'd set that up.</p>
+      <p>I'll go through the pieces one by one, then follow a single table, <code>orders</code>, from the first request to production, so you can see how they fit together.</p>
 
       <h2>What gets decided up front</h2>
 
@@ -50,7 +50,7 @@
       <ul>
         <li><strong>The global architecture.</strong> A layered lakehouse: raw / bronze / silver / gold, or landing / bronze / curated. The names don't matter much, the discipline does. Each layer has a fixed contract about what it holds and how much you can trust it.</li>
         <li><strong>The abstraction layer.</strong> A library of tested classes the agent composes, instead of raw Spark it makes up.</li>
-        <li><strong>The deployment path.</strong> Terraform and a CI pipeline, written by people, that validate, test, and promote between environments.</li>
+        <li><strong>The deployment path.</strong> CI and infrastructure code. People write it once and it works the same way for every pipeline, so I won't spend much time on it.</li>
       </ul>
 
       <p>Honestly, the agent is the least important part. The tested building blocks and the structure around them do most of the work. The agent just connects them faster than I would.</p>
@@ -86,11 +86,11 @@
 
       <p>This is the part that actually makes agents safe. We don't let agents write Spark, with each one reinventing what a bronze-to-silver step looks like. Those steps are nearly identical across pipelines anyway: read a source, standardize it, apply changes in order, enforce quality, write a table. So we write that logic <strong>once</strong>, as tested classes, and register them in a catalog the agent draws from.</p>
 
-<pre><code>RawToBronze      # land + parse + capture rescued columns
-BronzeToSilver   # dedup, standardize, apply CDC/SCD
-ApplyCDC         # apply an ordered change feed
-ApplySCD2        # keep history with validity dates
-QualityGate      # nulls, ranges, uniqueness, referential</code></pre>
+<pre><code>RawToBronze   # land + parse + capture rescued columns
+Standardize   # cast types, rename, normalize formats
+ApplyCDC      # apply an ordered change feed, keep latest (SCD type 1)
+ApplySCD2     # apply an ordered change feed, keep history
+QualityGate   # nulls, ranges, uniqueness, referential</code></pre>
 
       <p>Think about the level an agent could generate at:</p>
 
@@ -116,6 +116,7 @@ target:
   sequence_by: updated_at      # orders change events
   scd: type_2                  # keep history
   cdc: true                    # source is a change feed
+schedule: "@hourly"            # also used to generate the DAG
 schema:
   - {name: order_id,   type: string,  nullable: false}
   - {name: amount,     type: decimal(18,2)}
@@ -123,7 +124,7 @@ schema:
   - {name: updated_at, type: timestamp}
 quality:
   - not_null: [order_id, amount]
-  - unique: [order_id]</code></pre>
+  - unique_current: [order_id]   # one current row per order</code></pre>
 
       <p>Two terms in there drive the choice of abstractions:</p>
 
@@ -140,11 +141,30 @@ quality:
 
       <p>Each entry carries what the agent needs to choose well: a name, a one-line "use this when", typed parameters, and preconditions (<code>ApplySCD2</code> requires a <code>sequence_by</code> column, for example). The agent gets the contract plus the catalog and is asked for a <strong>plan</strong>: which abstractions, in what order, with which parameters. Not code.</p>
 
+      <p>For the <code>orders</code> contract, the plan looks something like this:</p>
+
+<pre><code>pipeline: silver_orders
+steps:
+  - use: RawToBronze
+    with: {source: s3://raw/salesforce/orders/, format: json}
+  - use: Standardize
+    with: {schema: contract.schema}
+  - use: QualityGate
+    with: {not_null: [order_id, amount]}
+  - use: ApplySCD2
+    with: {keys: [order_id], sequence_by: updated_at,
+           partition_by: date(updated_at),
+           target: catalog.silver.orders}
+  - use: QualityGate
+    with: {unique_current: [order_id]}</code></pre>
+
+      <p>That's all the agent produces at this stage. No Spark, no SQL. Each step names a block from the catalog and fills in parameters taken from the contract. Reviewing it means reading a dozen lines against the contract, not auditing a pipeline.</p>
+
       <p>Two properties make this safe:</p>
 
       <ul>
         <li><strong>Closed vocabulary.</strong> The agent composes only from the catalog and can't invent a transform. If a contract needs something the catalog doesn't have, the agent escalates to a person instead of improvising. That's on purpose.</li>
-        <li><strong>Validation before generation.</strong> The plan is checked against each abstraction's preconditions before any code or Terraform is written, so a bad wiring is caught structurally rather than at runtime.</li>
+        <li><strong>Validation before generation.</strong> The plan is checked against each abstraction's preconditions before anything is generated, so a bad wiring is caught structurally rather than at runtime.</li>
       </ul>
 
       <p>If you've built agentic systems, this is the familiar tool-use pattern: you aren't asking the model to be creative, you're asking it to pick correctly from a vetted menu. One thing that's easy to forget: <strong>the descriptions in the catalog need to be maintained like code</strong>. If a description is vague, the agent's choices will be vague too.</p>
@@ -156,9 +176,9 @@ quality:
       <ul>
         <li><strong>Contract review.</strong> A person writes or approves the contract before anything runs. An agent can draft one from a business description, but a person signs off, because business intent is the one thing the agent must never assume.</li>
         <li><strong>Plan review.</strong> The agent proposes its plan and a person checks it: "you chose <code>ApplySCD2</code> keyed on <code>order_id</code>, sequenced by <code>updated_at</code>. Is that right?" This happens before any code exists.</li>
-        <li><strong>Diff review.</strong> The agent emits pipeline config and Terraform as a PR, and a person reviews the diff like any other change.</li>
+        <li><strong>Diff review.</strong> The agent opens a PR with the generated config, and a person reviews the diff like any other change.</li>
         <li><strong>Tests and approval before promotion.</strong> Tests run against the produced tables, and a person approves promotion between environments. This is where you catch an agent that dropped a table or skipped a rule.</li>
-        <li><strong>DAG checks.</strong> The agent generates orchestration jobs from an orchestration contract, and a person runs DAG unit tests (the kind <a href="https://www.astronomer.io/docs/learn/testing-airflow">Astronomer documents for Airflow</a>) to make sure no job went missing.</li>
+        <li><strong>DAG checks.</strong> The agent also writes the Airflow DAG, using the schedule from the same contract, and a person runs DAG unit tests (the kind <a href="https://www.astronomer.io/docs/learn/testing-airflow">Astronomer documents for Airflow</a>) to make sure no task or dependency went missing.</li>
       </ul>
 
       <p>Each of these checks catches a specific kind of mistake. They're not there just to have a review step.</p>
@@ -176,12 +196,29 @@ quality:
             <tr><td>Contract</td><td>Written by a person, or drafted by the agent and approved by a person</td></tr>
             <tr><td>Bronze to silver pipeline</td><td>Generated by the agent (config over tested blocks), reviewed by a person</td></tr>
             <tr><td>Quality, SCD, CDC rules</td><td>Declared in the contract, implemented by abstractions</td></tr>
-            <tr><td>Terraform and CI</td><td>Path written by people; the agent proposes changes, a person approves, CI enforces</td></tr>
+            <tr><td>CI and deployment</td><td>Written by people once, same for every pipeline</td></tr>
             <tr><td>DAGs / orchestration</td><td>Generated by the agent from the contract, unit-tested by a person</td></tr>
             <tr><td>Gold layer</td><td>Written by people, with an assistant at most</td></tr>
           </tbody>
         </table>
       </div>
+
+      <h2>One table, start to finish</h2>
+
+      <p>Here's the whole thing in order, using the <code>orders</code> table from above.</p>
+
+      <ol>
+        <li><strong>The request.</strong> Someone on the finance side needs order history in silver, including how an order's status changed over time. At this point it's a business need, not a spec.</li>
+        <li><strong>The contract.</strong> The agent drafts the contract from that request: <code>order_id</code> as the key, <code>updated_at</code> to order changes, SCD type 2 because they want history, decimal for amounts, an hourly schedule. A person reads it and signs off. This is where business intent gets pinned down, so it's never skipped.</li>
+        <li><strong>The plan.</strong> The agent reads the contract and the catalog and outputs the plan shown earlier. Still no code.</li>
+        <li><strong>Validation.</strong> The plan is checked automatically: every step is in the catalog, <code>ApplySCD2</code> has the <code>sequence_by</code> it needs, every column it mentions exists in the contract. A plan that fails here never reaches a person.</li>
+        <li><strong>Plan review.</strong> A person checks the choices: SCD2 keyed on <code>order_id</code>, ordered by <code>updated_at</code>, partitioned by event date. That takes a few minutes.</li>
+        <li><strong>Generation.</strong> The agent turns the plan into pipeline config plus an Airflow DAG and opens a PR. The config only points at tested classes; nothing is hand-written Spark.</li>
+        <li><strong>CI and deploy.</strong> CI runs the same way for every pipeline: tests against sample data, DAG unit tests, and a preview of the infrastructure change with a cost estimate. Cluster size is capped by policy, so a generated pipeline can't quietly ask for a huge cluster. A person approves the PR and CI promotes it from dev to prod.</li>
+        <li><strong>Running.</strong> Every hour the pipeline reads the newest <code>ingest_date</code> partitions from raw, applies changes in <code>updated_at</code> order, and merges into silver by event date. If a bug shows up in a block later, it gets fixed once and the affected ingestion dates are replayed from raw.</li>
+      </ol>
+
+      <p>The agent does three things here: drafts the contract (2), writes the plan (3), and generates the config (6). Everything else is a person or code people wrote.</p>
 
       <h2>A failure that gets through</h2>
 
@@ -192,12 +229,6 @@ quality:
       <p>The agent didn't do anything wrong. It built exactly what the contract said. The gap is that <strong>nothing checked the contract against the real source schema.</strong></p>
 
       <p>The fix is another guardrail: a schema drift check that compares the live source schema to the contract at ingestion and flags differences for review, plus rescued-column capture in bronze so an undeclared field is never silently dropped. The agent can only be as good as the contract, so you need something that checks the contract against the real data. A better model wouldn't fix this. A simple schema check would.</p>
-
-      <h2>Deployment and cost</h2>
-
-      <p>A person approving the PR just starts things. The actual checks happen in CI, which people wrote. Once someone approves, CI runs the tests, shows the Terraform <code>plan</code> before any <code>apply</code>, and promotes across environments. So the risky parts don't depend on the agent making good calls.</p>
-
-      <p>Cost needs its own check. When pipelines are this easy to create, it's also easy to end up with a big bill. Put cost controls in the same CI path: cluster size limits through policy, and a cost estimate shown on the Terraform plan so the reviewer sees the bill before approving.</p>
 
       <h2>When not to use this</h2>
 
