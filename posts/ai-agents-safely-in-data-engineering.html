@@ -53,7 +53,7 @@
         <li><strong>The deployment path.</strong> CI and infrastructure code. People write it once and it works the same way for every pipeline, so I won't spend much time on it.</li>
       </ul>
 
-      <p>Honestly, the agent is the least important part. The tested building blocks and the structure around them do most of the work. The agent just connects them faster than I would.</p>
+      <p>The agent is what makes this worth doing. It can go from a contract to a working pipeline in minutes, and it's just as fast on the fiftieth table as on the first. But it's only safe to use because of the structure around it: the tested building blocks and the rules above. That structure is what most of this post is about.</p>
 
       <h2>The raw zone</h2>
 
@@ -218,7 +218,7 @@ steps:
         <li><strong>Running.</strong> Every hour the pipeline reads the newest <code>ingest_date</code> partitions from raw, applies changes in <code>updated_at</code> order, and merges into silver by event date. If a bug shows up in a block later, it gets fixed once and the affected ingestion dates are replayed from raw.</li>
       </ol>
 
-      <p>The agent does three things here: drafts the contract (2), writes the plan (3), and generates the config (6). Everything else is a person or code people wrote.</p>
+      <p>The agent does three things here: drafts the contract (2), writes the plan (3), and generates the config (6). Those three are where most of the hands-on time used to go. Everything else is a person or code people wrote.</p>
 
       <h2>A failure that gets through</h2>
 
