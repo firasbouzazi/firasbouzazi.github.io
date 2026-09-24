@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Apache Iceberg compaction in practice · Firas Bouzazi</title>
+<meta name="description" content="How Iceberg is organized, why small files hurt, how to run compaction with Spark and on AWS, the three strategies, and the rest of table maintenance.">
+<meta name="author" content="Firas Bouzazi">
+<meta property="og:title" content="Apache Iceberg compaction in practice">
+<meta property="og:description" content="A practical guide: architecture, compaction strategies, hands-on examples (AWS and Spark) and full table maintenance.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://firasbouzazi.github.io/posts/apache-iceberg-compaction-in-practice.html">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' font-family='monospace'>·</text></svg>">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site-head">
+  <a class="home" href="/">firas bouzazi</a>
+  <button class="theme-toggle" type="button" aria-label="Toggle color theme">theme</button>
+</header>
+
+<main class="wrap">
+  <article class="post">
+
+    <header class="post-head">
+      <p class="meta">2026-05-26</p>
+      <h1>Apache Iceberg compaction in practice</h1>
+      <p class="dek">A practical guide: architecture, compaction strategies, hands-on examples (AWS and Spark) and full table maintenance.</p>
+    </header>
+
+    <div class="prose">
+      <p>This article assumes you've heard of Apache Iceberg and maybe played with it a little, but compaction still feels like a black box. These are my notes from going deep on it: how it works, how to run it, and how to not shoot yourself in the foot.</p>
+
+      <h2>1. Reminder of Apache Iceberg architecture</h2>
+
+      <p>Before talking about compaction, let's do a quick recap of how Iceberg organizes things under the hood. It will help make sense of why compaction even matters.</p>
+
+      <figure class="diagram">
+          <svg viewBox="0 0 400 410" role="img" aria-labelledby="arch-title">
+          <title id="arch-title">Iceberg architecture: the catalog points to the current metadata file. Metadata files point to manifest lists, one per snapshot. Manifest lists point to manifest files, and manifest files point to the data files.</title>
+          <defs><marker id="arch-ah" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker></defs>
+          <rect class="group" x="6" y="66" width="388" height="220" rx="4"/>
+          <text class="group-title" x="16" y="82">METADATA LAYER</text>
+          <rect class="group" x="6" y="302" width="388" height="100" rx="4"/>
+          <text class="group-title" x="16" y="394">DATA LAYER</text>
+          <rect class="box strong" x="120" y="8" width="160" height="38" rx="3"/>
+          <text class="label" x="200" y="27"><tspan x="200" dy="-0.6em">catalog</tspan><tspan class="label sm" x="200" dy="1.25em">points to current metadata</tspan></text>
+          <rect class="box" x="50" y="94" width="120" height="38" rx="3"/>
+          <text class="label" x="110" y="113"><tspan x="110" dy="-0.6em">metadata file</tspan><tspan class="label" x="110" dy="1.25em">[s0]</tspan></text>
+          <rect class="box" x="230" y="94" width="120" height="38" rx="3"/>
+          <text class="label" x="290" y="113"><tspan x="290" dy="-0.6em">metadata file</tspan><tspan class="label" x="290" dy="1.25em">[s0, s1]</tspan></text>
+          <rect class="box" x="70" y="164" width="120" height="34" rx="3"/>
+          <text class="label" x="130" y="181"><tspan x="130" dy="-0.6em">manifest list</tspan><tspan class="label sm" x="130" dy="1.25em">snapshot s0</tspan></text>
+          <rect class="box" x="250" y="164" width="120" height="34" rx="3"/>
+          <text class="label" x="310" y="181"><tspan x="310" dy="-0.6em">manifest list</tspan><tspan class="label sm" x="310" dy="1.25em">snapshot s1</tspan></text>
+          <rect class="box" x="28" y="236" width="104" height="34" rx="3"/>
+          <text class="label" x="80" y="253">manifest file</text>
+          <rect class="box" x="148" y="236" width="104" height="34" rx="3"/>
+          <text class="label" x="200" y="253">manifest file</text>
+          <rect class="box" x="268" y="236" width="104" height="34" rx="3"/>
+          <text class="label" x="320" y="253">manifest file</text>
+          <rect class="box auto" x="28" y="316" width="104" height="34" rx="3"/>
+          <text class="label" x="80" y="333">data files</text>
+          <rect class="box auto" x="148" y="316" width="104" height="34" rx="3"/>
+          <text class="label" x="200" y="333">data files</text>
+          <rect class="box auto" x="268" y="316" width="104" height="34" rx="3"/>
+          <text class="label" x="320" y="333">data files</text>
+          <path class="edge" d="M235 46 L280 94" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M110 132 L125 164" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M270 132 L165 164" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M300 132 L310 164" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M110 198 L85 236" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M150 198 L195 236" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M310 198 L318 236" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M80 270 L80 316" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M200 270 L200 316" marker-end="url(#arch-ah)"/>
+          <path class="edge" d="M320 270 L320 316" marker-end="url(#arch-ah)"/>
+          </svg>
+        <figcaption>How a query finds its data: catalog, metadata, manifests, data files.</figcaption>
+      </figure>
+
+      <h3>Data layer</h3>
+
+      <p>This is where the actual data lives. It's made of datafiles that store the rows themselves (Parquet, ORC, Avro…). Those files are the leaves of the tree.</p>
+
+      <p>There's also another type of file here: delete files. They don't store data, they track which records of existing datafiles have been deleted. Iceberg uses them to handle deletes efficiently without immediately rewriting the full datafile.</p>
+
+      <h3>Metadata layer</h3>
+
+      <p>This is the brain of the table. It's a three-level structure:</p>
+
+      <ul>
+        <li><strong>Manifest files:</strong> track a subset of the datafiles in the data layer, plus some extra stats per file (row counts, min/max values, etc.)</li>
+        <li><strong>Manifest lists:</strong> a snapshot of the full table at a given point in time. Each snapshot maintains all the manifest files needed to reconstruct the table at that moment.</li>
+        <li><strong>Metadata files:</strong> sit at the top. They track all the manifest lists (= all snapshots), and also store table-level info: table name, partition spec, schema history, etc.</li>
+      </ul>
+
+      <h3>The catalog</h3>
+
+      <p>The catalog is basically the entry point. It holds a pointer to the current metadata file for each table. When you run a query, Iceberg goes to the catalog first, follows the pointer to the metadata file, walks down through the manifest list and manifest files, and finally reads the relevant datafiles.</p>
+
+      <p>You can use several catalog implementations: Hive Metastore, AWS Glue, REST catalog, Nessie, and others.</p>
+
+      <h2>2. Compaction</h2>
+
+      <p>Compaction is one of the most important maintenance operations for keeping an Iceberg table healthy. In short: it reads a bunch of small files and merges them into fewer, larger files. You can also sort the data in the process, which we'll get to later.</p>
+
+      <figure class="diagram">
+          <svg viewBox="0 0 440 214" role="img" aria-labelledby="cmp-title">
+          <title id="cmp-title">Before compaction: many small files between 1 and 32 MB. After rewrite_data_files: a few files of about 256 MB each.</title>
+          <defs><marker id="cmp-ah" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker></defs>
+          <text class="lane-title" x="86" y="16">BEFORE</text>
+          <text class="lane-title" x="355" y="16">AFTER</text>
+          <rect class="box" x="8" y="30" width="41" height="41" rx="3"/>
+          <text class="label xs" x="28" y="50">32MB</text>
+          <rect class="box" x="54" y="42" width="17" height="17" rx="3"/>
+          <rect class="box" x="76" y="37" width="27" height="27" rx="3"/>
+          <text class="label xs" x="89" y="50">8MB</text>
+          <rect class="box" x="108" y="40" width="22" height="22" rx="3"/>
+          <rect class="box" x="134" y="36" width="30" height="30" rx="3"/>
+          <text class="label xs" x="150" y="50">12MB</text>
+          <rect class="box" x="6" y="78" width="33" height="33" rx="3"/>
+          <text class="label xs" x="23" y="94">16MB</text>
+          <rect class="box" x="44" y="77" width="35" height="35" rx="3"/>
+          <text class="label xs" x="62" y="94">20MB</text>
+          <rect class="box" x="84" y="86" width="17" height="17" rx="3"/>
+          <rect class="box" x="106" y="86" width="17" height="17" rx="3"/>
+          <rect class="box" x="128" y="76" width="37" height="37" rx="3"/>
+          <text class="label xs" x="147" y="94">24MB</text>
+          <rect class="box" x="2" y="118" width="40" height="40" rx="3"/>
+          <text class="label xs" x="22" y="138">28MB</text>
+          <rect class="box" x="48" y="125" width="27" height="27" rx="3"/>
+          <text class="label xs" x="61" y="138">8MB</text>
+          <rect class="box" x="80" y="118" width="41" height="41" rx="3"/>
+          <text class="label xs" x="100" y="138">32MB</text>
+          <rect class="box" x="126" y="130" width="17" height="17" rx="3"/>
+          <rect class="box" x="148" y="128" width="22" height="22" rx="3"/>
+          <rect class="box strong" x="277" y="30" width="74" height="74" rx="3"/>
+          <text class="label" x="314" y="67">256MB</text>
+          <rect class="box strong" x="359" y="30" width="74" height="74" rx="3"/>
+          <text class="label" x="396" y="67">256MB</text>
+          <rect class="box strong" x="277" y="112" width="74" height="74" rx="3"/>
+          <text class="label" x="314" y="149">256MB</text>
+          <rect class="box strong" x="359" y="112" width="74" height="74" rx="3"/>
+          <text class="label" x="396" y="149">256MB</text>
+          <path class="edge" d="M178 110 H262" marker-end="url(#cmp-ah)"/>
+          <text class="label xs" x="220" y="90"><tspan x="220" dy="-0.6em">rewrite_</tspan><tspan x="220" dy="1.25em">data_files()</tspan></text>
+          <text class="caption" x="86" y="206">many small files</text>
+          <text class="caption" x="355" y="206">few files, same size</text>
+          </svg>
+        <figcaption>Compaction rewrites many small files into a few files near the target size.</figcaption>
+      </figure>
+
+      <h3>Why do we need it?</h3>
+
+      <p>Imagine a table that has accumulated thousands of small datafiles. This is called the small files problem, and it causes real pain:</p>
+
+      <ul>
+        <li>Queries slow down significantly. Each time you run a query, Iceberg must open each file, read metadata, plan execution, then close it. 10,000 files = 10,000 open/read operations.</li>
+        <li>More files means a bigger metadata footprint. More manifest entries = slower query planning.</li>
+        <li>On managed services (AWS, GCP, Azure…), every file open is a storage request. More requests = higher cost.</li>
+      </ul>
+
+      <p>This happens more often than you'd think. Typical causes:</p>
+
+      <ul>
+        <li>Streaming writes with low throughput (Flink, Kafka consumers)</li>
+        <li>Spark micro-batches writing frequently</li>
+        <li>CDC event logging</li>
+      </ul>
+
+      <p>The fix: periodically run compaction to reshape your data into fewer, larger files.</p>
+
+      <h2>3. Hands-on compaction with Spark</h2>
+
+      <h3>3.1 Simple way: the SQL command</h3>
+
+      <p>The easiest way to trigger compaction:</p>
+
+<pre><code>CALL system.rewrite_data_files(
+  table =&gt; &#x27;my_db.my_table&#x27;
+);</code></pre>
+
+      <p>This scans for small files and merges them. By default it targets the file size set in the table property <code>write.target-file-size-bytes</code>, which defaults to 512 MB.</p>
+
+      <p>You can also pass parameters explicitly:</p>
+
+<pre><code>CALL system.rewrite_data_files(
+  table =&gt; &#x27;my_db.my_table&#x27;,
+  options =&gt; map(
+    &#x27;min-input-files&#x27;, &#x27;5&#x27;,
+    &#x27;target-file-size-bytes&#x27;, &#x27;536870912&#x27;  -- 512MB
+  )
+);</code></pre>
+
+      <p>Or compact only a specific partition, very useful for daily incremental pipelines:</p>
+
+<pre><code>CALL system.rewrite_data_files(
+  table =&gt; &#x27;my_db.my_table&#x27;,
+  where =&gt; &#x27;event_date = DATE &quot;2026-05-20&quot;&#x27;
+);</code></pre>
+
+      <p class="tip">Compaction is heuristic-based, not perfect packing. You may still see files with slightly different sizes at the end, that's normal.</p>
+
+      <h3>3.2 Using the DataFrame API</h3>
+
+      <p>If you want to trigger compaction programmatically (useful inside an Airflow DAG or a cron maintenance script), you can just wrap the SQL call:</p>
+
+<pre><code>spark.sql(&quot;&quot;&quot;
+  CALL system.rewrite_data_files(
+    table =&gt; &#x27;my_db.my_table&#x27;,
+    options =&gt; map(
+      &#x27;target-file-size-bytes&#x27;, &#x27;268435456&#x27;
+    )
+  )
+&quot;&quot;&quot;)</code></pre>
+
+      <h3>3.3 Sort and compact</h3>
+
+      <p>You can also sort and compact at the same time, which gives you better query performance down the line (more on strategies in section 4):</p>
+
+<pre><code>CALL system.rewrite_data_files(
+  table =&gt; &#x27;my_db.my_table&#x27;,
+  strategy =&gt; &#x27;sort&#x27;,
+  sort_order =&gt; &#x27;event_time&#x27;
+);</code></pre>
+
+      <p>A typical Airflow setup might look like this, running on a 1-day or 1-week interval:</p>
+
+<pre><code>def compact():
+    spark.sql(&quot;&quot;&quot;
+        CALL system.rewrite_data_files(
+            table =&gt; &#x27;prod.events&#x27;,
+            where =&gt; &#x27;event_date &gt;= current_date - INTERVAL 1 DAY&#x27;
+        )
+    &quot;&quot;&quot;)</code></pre>
+
+      <h3>3.4 Advanced parameters</h3>
+
+      <p>A few options worth knowing about:</p>
+
+      <ul>
+        <li><code>max-concurrent-file-group-rewrites</code>: ceiling on how many file groups to rewrite in parallel.</li>
+        <li><code>max-file-group-size-bytes</code>: limits how much data is processed in one rewrite task. Useful to avoid OOM issues on large partitions. Iceberg splits the work into manageable groups.</li>
+        <li><code>partial-progress-enabled</code>: allows Iceberg to commit results incrementally during compaction instead of waiting for the whole job to finish. Already-compacted groups become visible sooner, and if the job fails, you don't lose everything.</li>
+        <li><code>partial-progress-max-commits</code>: controls how many intermediate commits Iceberg is allowed to make when partial progress is enabled.</li>
+      </ul>
+
+      <p>Without partial progress, compaction works like this:</p>
+
+      <ol>
+        <li>Read many small files</li>
+        <li>Rewrite them</li>
+        <li>Commit everything at once at the end</li>
+      </ol>
+
+      <p>The problem: if the job is very large, a failure means losing ALL progress. When Airflow retries the task, Iceberg re-scans the table, skips already-compacted data, and only processes the remaining small files. Partial progress makes this much more robust.</p>
+
+      <p class="tip">Running compaction too often can be a waste of compute and cause rewrite churn. Don't forget delete files either; see section 5 on full table maintenance.</p>
+
+      <h3>3.5 AWS: Athena, EMR, Glue</h3>
+
+      <p>On AWS you can run compaction through Amazon Athena, or using Spark on Amazon EMR / AWS Glue:</p>
+
+      <ul>
+        <li>Athena uses the <code>OPTIMIZE</code> statement. One nice thing: Athena pricing is based on data scanned, so if there's nothing to compact, there's no cost. Run it per partition to avoid timeouts.</li>
+        <li>For large compaction jobs on EMR or Glue, use dynamic scaling so the cluster adjusts to the workload.</li>
+        <li>For Z-order sorting specifically, prefer EMR or Glue: Z-order is expensive and may need to spill data to disk. Athena is less suited for it.</li>
+      </ul>
+
+      <p><strong>Rule of thumb: compaction frequency and size</strong></p>
+
+      <ul>
+        <li>Daily → for batch pipelines</li>
+        <li>Every few hours → for streaming pipelines</li>
+        <li>Target file size: 256 MB to 1 GB</li>
+      </ul>
+
+      <h2>4. Compaction strategies</h2>
+
+      <p>Not all compaction is the same. Iceberg offers three strategies, each with a different tradeoff between cost and query performance. Here's a comparison:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Strategy</th><th>Speed</th><th>Best for</th><th>Query gain</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Binpack</td><td>Fast</td><td>Streaming SLAs, frequent runs</td><td>Fewer file opens</td></tr>
+            <tr><td>Sort</td><td>Medium</td><td>Filters on one column</td><td>Data skipping via min/max stats</td></tr>
+            <tr><td>Z-order</td><td>Slow</td><td>Multi-column filters</td><td>Highest for multi-dimensional queries</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Binpack (default)</h3>
+
+      <p>Takes many small files and packs them into larger files close to the target size. It doesn't rearrange the data at all, it just packs files together.</p>
+
+      <p>Use this when you need fast compaction with a short SLA. For example, running compaction every hour for streaming data to keep read performance acceptable. You can always run a more thorough sort-based compaction on a longer window (e.g. nightly) if needed.</p>
+
+      <h3>Sort compaction</h3>
+
+      <p>Compacts files AND sorts the data inside them based on one or more columns. The main benefit: query engines can use Iceberg's per-file min/max statistics to skip entire files when filtering, which can dramatically reduce the amount of data scanned.</p>
+
+      <p>To get the most out of sort compaction, you need to understand how your end users are querying the data: what columns do they filter on most? Sort on those.</p>
+
+      <p class="tip">Slower than binpack but pays off in query performance, especially on large tables with selective filters.</p>
+
+      <h3>Z-order compaction</h3>
+
+      <p>Z-order is for when you regularly filter on multiple columns at once. It reorganizes data using a Z-order space-filling curve to cluster rows that are close in multiple dimensions together on disk.</p>
+
+      <p>For example: instead of storing rows randomly, the Z-path groups records from the same region (say ages 1 to 50 and heights 5 to 10 ft) into the same files. A query filtering on both age and height can then skip most of the files entirely.</p>
+
+<pre><code>CALL catalog.system.rewrite_data_files(
+  table =&gt; &#x27;people&#x27;,
+  strategy =&gt; &#x27;sort&#x27;,
+  sort_order =&gt; &#x27;zorder(age, height)&#x27;
+);</code></pre>
+
+      <p class="tip">If an Iceberg table has a sort order defined in its table properties, even binpack will respect it within each task, so the two aren't mutually exclusive.</p>
+
+      <p>Z-order is the most expensive strategy. On AWS, use EMR or Glue rather than Athena for this.</p>
+
+      <h2>5. Full table maintenance</h2>
+
+      <p>Compaction is important, but it's only one part of keeping an Iceberg table in good shape. There are three other operations that go hand in hand with it:</p>
+
+      <h3>5.1 Compacting delete files</h3>
+
+      <p>Every time you run a <code>DELETE</code> or <code>UPDATE</code> on an Iceberg table (without a full file rewrite), Iceberg writes a delete file instead of touching the datafiles. Over time these accumulate and slow down reads: every query has to check them.</p>
+
+      <p>The command to clean them up:</p>
+
+<pre><code>CALL system.rewrite_position_deletes(
+  table =&gt; &#x27;my_db.my_table&#x27;
+);</code></pre>
+
+      <p class="tip">Run this after or alongside regular compaction, ideally on the same schedule.</p>
+
+      <h3>5.2 Expiring snapshots</h3>
+
+      <p>Every operation on an Iceberg table creates a new snapshot. These are useful for time travel, but if you never clean them up they pile up forever, bloating your metadata and your storage.</p>
+
+<pre><code>CALL system.expire_snapshots(
+  table =&gt; &#x27;my_db.my_table&#x27;,
+  older_than =&gt; TIMESTAMP &#x27;2026-05-19 00:00:00&#x27;
+);</code></pre>
+
+      <p>A typical policy: keep the last 1 to 2 days of snapshots. For most use cases that's more than enough for time travel and rollback.</p>
+
+      <h3>5.3 Removing orphan files</h3>
+
+      <p>Sometimes files end up on storage without being referenced by any snapshot. This can happen due to failed writes, aborted jobs, or just bugs. These orphan files just waste space.</p>
+
+<pre><code>CALL system.remove_orphan_files(
+  table =&gt; &#x27;my_db.my_table&#x27;
+);</code></pre>
+
+      <p class="tip">Be careful with this one. Make sure the retention period is long enough to not accidentally delete files that belong to in-progress jobs.</p>
+
+      <h3>5.4 When NOT to compact</h3>
+
+      <p>It's easy to set up compaction and forget about it, but running it too aggressively can cause problems:</p>
+
+      <ul>
+        <li>Running compaction on huge tables entirely every time is wasteful; prefer partition-based compaction where possible</li>
+        <li>Compacting too frequently causes rewrite churn: you end up rewriting files that just got compacted</li>
+        <li>Z-order on very large datasets can OOM your executors; use <code>max-file-group-size-bytes</code> to limit the blast radius</li>
+        <li>Always test your compaction schedule against your actual workload before locking it in</li>
+      </ul>
+
+      <p>My Iceberg notes were giving small files problem energy, so I compacted them into an article. 🧊</p>
+
+      <hr>
+
+      <h3>Sources</h3>
+      <ul>
+        <li>AWS Prescriptive Guidance, <a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/apache-iceberg-on-aws/best-practices-compaction.html">Best practices for compaction</a></li>
+        <li><a href="https://www.oreilly.com/library/view/apache-iceberg-the/9781098148614/">Apache Iceberg: The Definitive Guide</a> (O'Reilly)</li>
+        <li><a href="https://iceberg.apache.org/docs/latest/">Apache Iceberg documentation</a></li>
+      </ul>
+
+      <p class="origin">Originally published on <a href="https://www.linkedin.com/pulse/apache-iceberg-compaction-practice-strategies-tuning-firas-bouzazi-dpxcf/">LinkedIn</a> on May 26, 2026.</p>
+    </div>
+
+    <a class="back" href="/">Back home</a>
+
+  </article>
+</main>
+
+<footer class="site-foot">
+  <span>Firas Bouzazi</span>
+  <span class="spacer"></span>
+  <a href="https://github.com/firasbouzazi">GitHub</a>
+  <a href="https://www.linkedin.com/in/firas-bouzazi/">LinkedIn</a>
+  <a href="mailto:firas.bouzazi@imt-atlantique.net">Email</a>
+</footer>
+
+<script src="../theme.js"></script>
+</body>
+</html>

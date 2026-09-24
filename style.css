@@ -353,12 +353,37 @@ figcaption {
 .diagram .lane-line { stroke: var(--rule); stroke-dasharray: 2 4; }
 .diagram .lane-title { fill: var(--faint); font-size: 9.5px; letter-spacing: .12em; text-anchor: middle; }
 .diagram .box { fill: var(--bg); stroke: var(--muted); stroke-width: 1; }
-.diagram .box.agent { fill: var(--code-bg); stroke: var(--fg); }
+.diagram .box.agent, .diagram .box.strong { fill: var(--code-bg); stroke: var(--fg); }
 .diagram .box.auto { stroke-dasharray: 3 3; }
 .diagram .label { fill: var(--fg); font-size: 11.5px; text-anchor: middle; dominant-baseline: central; }
 .diagram .num { fill: var(--faint); font-size: 10px; dominant-baseline: central; }
 .diagram .edge { fill: none; stroke: currentColor; stroke-width: 1; }
 .diagram .ah { fill: currentColor; }
+
+.diagram .group { fill: none; stroke: var(--rule); stroke-dasharray: 4 4; }
+.diagram .group-title { fill: var(--faint); font-size: 9.5px; letter-spacing: .12em; }
+.diagram .label.sm, .diagram .label .sm { font-size: 9.5px; fill: var(--muted); }
+.diagram .label.xs { font-size: 9px; }
+.diagram .caption { fill: var(--faint); font-size: 9.5px; text-anchor: middle; }
+
+/* Short tips inside a post */
+.prose .tip {
+  border-left: 2px solid var(--rule);
+  padding: .1rem 0 .1rem 1rem;
+  color: var(--muted);
+  font-size: .95rem;
+}
+.prose .tip::before {
+  content: "Note";
+  display: block;
+  font-family: var(--mono);
+  font-size: .68rem;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: .15rem;
+}
+.prose .origin { color: var(--muted); font-size: .9rem; }
 
 @media (max-width: 480px) {
   body { font-size: 18px; }
