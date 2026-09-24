@@ -364,6 +364,10 @@ figcaption {
 .diagram .group-title { fill: var(--faint); font-size: 9.5px; letter-spacing: .12em; }
 .diagram .label.sm, .diagram .label .sm { font-size: 9.5px; fill: var(--muted); }
 .diagram .label.xs { font-size: 9px; }
+.diagram .cell { fill: none; stroke: var(--muted); stroke-width: 1; }
+.diagram .cell.alt { fill: var(--code-bg); }
+.diagram .zpath { fill: none; stroke: var(--fg); stroke-width: 1.6; stroke-dasharray: 6 4; }
+.diagram .zdot { fill: var(--fg); }
 .diagram .caption { fill: var(--faint); font-size: 9.5px; text-anchor: middle; }
 
 /* Short tips inside a post */

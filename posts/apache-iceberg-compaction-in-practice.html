@@ -320,7 +320,40 @@
 
       <p>Z-order is for when you regularly filter on multiple columns at once. It reorganizes data using a Z-order space-filling curve to cluster rows that are close in multiple dimensions together on disk.</p>
 
-      <p>For example: instead of storing rows randomly, the Z-path groups records from the same region (say ages 1 to 50 and heights 5 to 10 ft) into the same files. A query filtering on both age and height can then skip most of the files entirely.</p>
+      <figure class="diagram">
+          <svg viewBox="0 0 400 300" role="img" aria-labelledby="z-title">
+          <title id="z-title">Z-order over age and height. The Z path visits one region at a time: young and tall, old and tall, young and short, old and short. Rows in the same region go into the same file.</title>
+          <defs><marker id="z-ah" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker></defs>
+          <rect class="cell alt" x="60" y="16" width="160" height="120"/>
+          <rect class="cell" x="220" y="16" width="160" height="120"/>
+          <rect class="cell" x="60" y="136" width="160" height="120"/>
+          <rect class="cell alt" x="220" y="136" width="160" height="120"/>
+          <path class="edge" d="M46 256 V18" marker-end="url(#z-ah)"/>
+          <path class="edge" d="M60 272 H378" marker-end="url(#z-ah)"/>
+          <text class="lane-title" x="0" y="0" transform="translate(28 136) rotate(-90)">HEIGHT</text>
+          <text class="lane-title" x="220" y="292">AGE</text>
+          <text class="label" x="140" y="40">Age 1-50</text>
+          <text class="label" x="140" y="56">Height 5-10ft</text>
+          <text class="label sm" x="140" y="71">file 1</text>
+          <text class="label" x="300" y="40">Age 51-100</text>
+          <text class="label" x="300" y="56">Height 5-10ft</text>
+          <text class="label sm" x="300" y="71">file 2</text>
+          <text class="label" x="140" y="190">Age 1-50</text>
+          <text class="label" x="140" y="206">Height 1-5ft</text>
+          <text class="label sm" x="140" y="221">file 3</text>
+          <text class="label" x="300" y="190">Age 51-100</text>
+          <text class="label" x="300" y="206">Height 1-5ft</text>
+          <text class="label sm" x="300" y="221">file 4</text>
+          <path class="zpath" d="M140 96 H300 L140 160 H291" marker-end="url(#z-ah)"/>
+          <circle class="zdot" cx="140" cy="96" r="4"/>
+          <circle class="zdot" cx="300" cy="96" r="4"/>
+          <circle class="zdot" cx="140" cy="160" r="4"/>
+          <circle class="zdot" cx="300" cy="160" r="4"/>
+          </svg>
+        <figcaption>The Z path visits one region at a time, so rows close in both age and height land in the same file.</figcaption>
+      </figure>
+
+      <p>In the diagram above: instead of storing rows randomly, the Z-path groups records from the same region (say ages 1 to 50 and heights 5 to 10 ft) into the same files. A query filtering on both age and height can then skip most of the files entirely.</p>
 
 <pre><code>CALL catalog.system.rewrite_data_files(
   table =&gt; &#x27;people&#x27;,
