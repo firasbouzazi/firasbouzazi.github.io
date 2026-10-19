@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monitoring a data pipeline · Firas Bouzazi</title>
+<meta name="description" content="What to monitor in a data pipeline, layer by layer: infrastructure, orchestration, streaming, the data itself, and row counts at every step, with example alerts.">
+<meta name="author" content="Firas Bouzazi">
+<meta property="og:title" content="Monitoring a data pipeline">
+<meta property="og:description" content="What to monitor in a data pipeline, layer by layer: infrastructure, orchestration, streaming, the data itself, and row counts at every step, with example alerts.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' font-family='monospace'>·</text></svg>">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site-head">
+  <a class="home" href="/">firas bouzazi</a>
+  <button class="theme-toggle" type="button" aria-label="Toggle color theme">theme</button>
+</header>
+
+<main class="wrap">
+  <article class="post">
+
+    <header class="post-head">
+      <p class="meta">2026-10-19</p>
+      <h1>Monitoring a data pipeline</h1>
+      <p class="dek">A green DAG is not the same thing as correct data. What I watch, layer by layer, and when I let it wake someone up.</p>
+    </header>
+
+    <div class="prose">
+      <p>The worst pipeline incident is not the one that fails loudly at 3 a.m. That one gets fixed. The worst one is the job that has been succeeding every hour for two weeks while writing half the rows it should, and nobody notices until a finance dashboard disagrees with the bank.</p>
+
+      <p>So when I set up monitoring for a pipeline I try to answer three questions, continuously and without a human looking:</p>
+
+      <ul>
+        <li><strong>Is it running?</strong> Jobs start, finish, and don't eat the machine.</li>
+        <li><strong>Is it on time?</strong> Data lands when consumers expect it, and streams keep up with their input.</li>
+        <li><strong>Is it right?</strong> The data that lands is complete, fresh, and looks like what it should.</li>
+      </ul>
+
+      <p>Most teams cover the first question well, because that's what generic infrastructure monitoring gives you for free. The second and third need work. This post goes through what I monitor, split into layers, with example metrics and alert rules for each. The tools in the examples (Prometheus, Airflow, Kafka, Spark, Flink, SQL) are the ones I use; the ideas carry over to whatever you have.</p>
+
+      <h2>The layers</h2>
+
+      <p>I find it useful to think of a pipeline as a stack. Each layer can break on its own, and each needs its own signals. A problem low in the stack usually shows up higher up too (a full disk becomes a failed task becomes stale data), but the reverse isn't true: the data can be wrong while every layer below it looks perfectly healthy.</p>
+
+      <figure class="diagram">
+        <svg viewBox="0 0 440 300" role="img" aria-labelledby="layers-title">
+          <title id="layers-title">Four monitoring layers stacked from bottom to top: infrastructure (CPU, memory, disk, network), pipeline and orchestration (failures, retries, duration, lag, backpressure), data (freshness, volume, schema, quality) and consumers (dashboards, SLAs). An arrow on the side shows that problems propagate upward, and that the data layer can fail while the lower layers look healthy.</title>
+          <defs><marker id="lay-ah" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path class="ah" d="M0 0 L10 5 L0 10 z"/></marker></defs>
+          <rect class="box" x="10" y="12" width="340" height="52" rx="3"/>
+          <text class="label" x="180" y="38"><tspan x="180" dy="-0.6em">Consumers</tspan><tspan class="label sm" x="180" dy="1.3em">dashboards, ML features, exports, SLAs</tspan></text>
+          <rect class="box strong" x="10" y="80" width="340" height="52" rx="3"/>
+          <text class="label" x="180" y="106"><tspan x="180" dy="-0.6em">Data</tspan><tspan class="label sm" x="180" dy="1.3em">freshness, volume, schema, quality, row counts</tspan></text>
+          <rect class="box" x="10" y="148" width="340" height="52" rx="3"/>
+          <text class="label" x="180" y="174"><tspan x="180" dy="-0.6em">Pipeline / orchestration</tspan><tspan class="label sm" x="180" dy="1.3em">failures, retries, duration, lag, backpressure</tspan></text>
+          <rect class="box" x="10" y="216" width="340" height="52" rx="3"/>
+          <text class="label" x="180" y="242"><tspan x="180" dy="-0.6em">Infrastructure</tspan><tspan class="label sm" x="180" dy="1.3em">CPU, memory, disk I/O, network, restarts</tspan></text>
+          <path class="edge" d="M392 266 L392 16" marker-end="url(#lay-ah)"/>
+          <text class="caption" x="392" y="284">problems</text>
+          <text class="caption" x="392" y="296">flow up</text>
+        </svg>
+        <figcaption>Each layer needs its own signals. Only the data layer tells you the output is right.</figcaption>
+      </figure>
+
+      <p>I'll go bottom-up, then spend most of the time on the data layer, because that's where the interesting bugs hide.</p>
+
+      <h2>1. Infrastructure</h2>
+
+      <p>This is the machines, containers, and managed services your jobs run on: Kubernetes nodes, EMR or Dataproc clusters, Databricks clusters, the Kafka brokers, the warehouse. The classic signals apply. I like Brendan Gregg's USE method here: for every resource, look at <strong>U</strong>tilization, <strong>S</strong>aturation, and <strong>E</strong>rrors.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Resource</th><th>What to watch</th><th>Why it matters for data jobs</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>CPU</td><td>Utilization, run queue / load, throttling in containers</td><td>Sustained 100% means the job is CPU-bound and will get slower as data grows. CPU throttling from a too-low container limit looks like "random" slowness.</td></tr>
+            <tr><td>Memory</td><td>Used vs. limit, OOM kills, JVM heap and GC time</td><td>The most common cause of Spark executor loss. Long GC pauses look like hangs.</td></tr>
+            <tr><td>Disk</td><td>Free space, I/O utilization, I/O wait, inode usage</td><td>Spark shuffle and spill, Kafka logs, and local temp files all fill disks. A full disk fails jobs in weird ways.</td></tr>
+            <tr><td>Network</td><td>Throughput, errors, dropped packets, cross-AZ traffic</td><td>Shuffles and object store reads are network-heavy. Cross-AZ traffic is also a cost line.</td></tr>
+            <tr><td>Containers / pods</td><td>Restarts, pending pods, evictions</td><td>A pod that restarts every few minutes may still "succeed" eventually, after many retries.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Example Prometheus rules, using metrics from <code>node_exporter</code> and <code>kube-state-metrics</code>:</p>
+
+<pre><code>groups:
+- name: infra
+  rules:
+  # Disk will be full in 4 hours at the current rate.
+  - alert: DiskFillingUp
+    expr: predict_linear(node_filesystem_avail_bytes{mountpoint="/data"}[1h], 4 * 3600) &lt; 0
+    for: 15m
+    labels: {severity: page}
+
+  # CPU above 90% for a sustained period, not a spike.
+  - alert: HighCpu
+    expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) &gt; 0.9
+    for: 30m
+    labels: {severity: ticket}
+
+  # Less than 10% memory available.
+  - alert: LowMemory
+    expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes &lt; 0.10
+    for: 10m
+    labels: {severity: ticket}
+
+  # A container was OOM-killed.
+  - alert: ContainerOOMKilled
+    expr: increase(kube_pod_container_status_restarts_total[15m]) &gt; 0
+          and on (namespace, pod, container)
+          kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+    labels: {severity: ticket}</code></pre>
+
+      <p>Two things I've learned here. First, use <code>predict_linear</code> for disks instead of a fixed "90% full" threshold: a disk at 91% that's flat is fine, a disk at 60% that's growing 10% an hour is not. Second, high CPU on a batch cluster is usually <em>good</em>, it means you're using what you pay for. I alert on it only when it's sustained <em>and</em> jobs are getting slower, otherwise it's just noise.</p>
+
+      <p class="tip">On managed and serverless platforms (BigQuery, Snowflake, Glue, Databricks serverless) you don't see CPU at all. The infra signals become slot usage, warehouse queueing, credits consumed, and query spill to remote storage. Same idea, different names.</p>
+
+      <h2>2. Pipeline and orchestration</h2>
+
+      <p>This layer is about the jobs themselves: did they run, did they finish, and how long did they take. For batch pipelines this mostly means your orchestrator (Airflow, Dagster, Prefect, a cron) and your compute engine (Spark, dbt, SQL).</p>
+
+      <h3>Job failures</h3>
+
+      <p>The obvious one, and the one everybody has. A task fails after exhausting its retries, someone should know. The point I'd add is: alert once per failed <em>run</em>, with a link to the logs, the run id, and the owner, not one message per failed task in a cascade of fifty downstream tasks.</p>
+
+      <p>In Airflow, a failure callback on the DAG's default args is enough to get started:</p>
+
+<pre><code>from datetime import timedelta
+from airflow.sdk import DAG
+
+def notify_failure(context):
+    ti = context["ti"]
+    send_alert(
+        title=f"{ti.dag_id}.{ti.task_id} failed",
+        run_id=context["run_id"],
+        try_number=ti.try_number,
+        log_url=ti.log_url,
+        owner=context["dag"].owner,
+    )
+
+default_args = {
+    "retries": 3,
+    "retry_delay": timedelta(minutes=2),
+    "retry_exponential_backoff": True,
+    "execution_timeout": timedelta(hours=1),
+    "on_failure_callback": notify_failure,
+}</code></pre>
+
+      <p>Note the <code>execution_timeout</code>. A task without a timeout can hang forever, and a hung task never fails, so a failure alert never fires. Every task should have one.</p>
+
+      <h3>Retries</h3>
+
+      <p>Retries hide problems. A job that succeeds on its third attempt every night looks green on the dashboard, but it's taking three times the compute, it's late, and it's one bad night away from failing for real. So I track retries as their own signal:</p>
+
+      <ul>
+        <li><strong>Retry rate per task</strong> over the last N runs. A task that suddenly needs retries when it never did before is a leading indicator of a failure.</li>
+        <li><strong>Retries by error type.</strong> Retrying a timeout from a flaky API is fine. Retrying a <code>KeyError</code> or a schema mismatch is pointless, it will fail the same way three times. Those errors should fail fast and not retry at all.</li>
+      </ul>
+
+      <p>I don't page on retries. I send a daily digest: "these tasks needed retries more than twice this week". It's the list of things that will break next.</p>
+
+      <h3>Duration and lateness</h3>
+
+      <p>Duration is the most underrated pipeline metric. A job that usually takes 20 minutes and today took 70 is telling you something: more data, a skewed key, a missing partition filter, a slow dependency. Compare each run to its own history, not to a fixed number, because a "normal" duration differs per job.</p>
+
+      <p>The related signal is <strong>lateness</strong>: is the data ready when the consumer needs it? If the finance report reads the <code>revenue</code> table at 7:00, what matters is whether the table was written by 6:45, not whether each task was fast. Airflow 3.1 has deadline alerts for exactly this, and one of the references is the average of past runs:</p>
+
+<pre><code>from datetime import timedelta
+from airflow.sdk import AsyncCallback, DAG, DeadlineAlert, DeadlineReference
+from airflow.providers.slack.notifications.slack_webhook import SlackWebhookNotifier
+
+with DAG(
+    dag_id="daily_revenue",
+    deadline=DeadlineAlert(
+        # Alert if the run is 30 minutes past its average runtime.
+        reference=DeadlineReference.AVERAGE_RUNTIME(max_runs=15, min_runs=5),
+        interval=timedelta(minutes=30),
+        callback=AsyncCallback(
+            SlackWebhookNotifier,
+            kwargs={"text": "{{ dag_run.dag_id }} is running much longer than usual"},
+        ),
+    ),
+):
+    ...</code></pre>
+
+      <h3>Scheduling and the orchestrator itself</h3>
+
+      <p>The orchestrator is a piece of infrastructure too, and when it's unhealthy nothing runs, which means no failure alerts fire either. Watch:</p>
+
+      <ul>
+        <li><strong>Scheduler heartbeat.</strong> Is the scheduler alive and looping?</li>
+        <li><strong>Queued tasks and time in queue.</strong> Tasks waiting a long time for a slot mean you're out of worker capacity or pool slots.</li>
+        <li><strong>Runs that never started.</strong> A schedule that should have produced a run at 02:00 and didn't. This needs a check from <em>outside</em> the orchestrator (more on that in the alerting section).</li>
+      </ul>
+
+      <h3>Compute engine signals</h3>
+
+      <p>For Spark jobs, the Spark UI and event logs give you most of what you need. The ones I look at when a job gets slow:</p>
+
+      <ul>
+        <li><strong>Failed tasks and lost executors</strong>, usually memory.</li>
+        <li><strong>Spill to disk</strong> (memory and disk spill per stage). A lot of spill means partitions are too big for executor memory.</li>
+        <li><strong>Skew:</strong> the max task duration in a stage vs. the median. If one task takes 40 minutes and the median takes 30 seconds, one key is carrying the whole stage.</li>
+        <li><strong>Shuffle read/write size</strong>, which tells you how much data is moving between executors.</li>
+      </ul>
+
+      <h2>3. Streaming: lag and backpressure</h2>
+
+      <p>Streaming pipelines need everything above, plus two signals that matter more than anything else: whether the consumer keeps up with the producer, and if not, where it's stuck.</p>
+
+      <h3>Consumer lag</h3>
+
+      <p>In Kafka, lag is the distance between the latest offset written to a partition and the offset your consumer group has committed. Lag that's stable is fine, every consumer has some. Lag that keeps growing means you're processing slower than data arrives, and it will keep growing until something changes.</p>
+
+      <p>The trap is alerting on lag in <em>messages</em>. 100,000 messages of lag is nothing on a topic receiving 50,000 per second, and a disaster on one receiving 10 per minute. Lag in <em>time</em> ("we're 12 minutes behind") is what consumers actually care about, and it's comparable across topics. Tools like <code>kafka-lag-exporter</code> estimate it for you:</p>
+
+<pre><code>- alert: ConsumerLagHigh
+  expr: max by (group, topic) (kafka_consumergroup_group_max_lag_seconds) &gt; 600
+  for: 10m
+  labels: {severity: page}
+  annotations:
+    summary: "{{ $labels.group }} is {{ $value | humanizeDuration }} behind on {{ $labels.topic }}"
+
+# Lag that only goes up: the consumer is not keeping up.
+- alert: ConsumerLagGrowing
+  expr: deriv(kafka_consumergroup_group_max_lag_seconds[30m]) &gt; 0
+        and kafka_consumergroup_group_max_lag_seconds &gt; 60
+  for: 30m
+  labels: {severity: ticket}</code></pre>
+
+      <p>The same idea applies to other systems: Kinesis has <code>GetRecords.IteratorAgeMilliseconds</code>, Pub/Sub has the age of the oldest unacked message. Use the age, not the count.</p>
+
+      <h3>Backpressure</h3>
+
+      <p>Backpressure is what happens when one stage of a streaming job is slower than the stage feeding it. The slow operator's input buffers fill up, it stops accepting data, and that pressure propagates upstream until the source reads slower. Lag tells you that you're behind. Backpressure tells you <em>where</em>.</p>
+
+      <ul>
+        <li><strong>Flink</strong> exposes per-task <code>backPressuredTimeMsPerSecond</code> and <code>busyTimeMsPerSecond</code>. The bottleneck is usually the first task in the chain that's busy close to 1000 ms/s while the tasks upstream of it are backpressured. Also watch checkpoint duration and failures: checkpoints slowing down is often the first symptom.</li>
+        <li><strong>Spark Structured Streaming</strong> reports <code>inputRowsPerSecond</code> and <code>processedRowsPerSecond</code> for each micro-batch. When processed stays below input, or the batch duration is consistently longer than the trigger interval, you're falling behind.</li>
+      </ul>
+
+      <p>Other streaming signals worth a panel: throughput in vs. out per stage, records sent to the dead letter queue, late events dropped by watermarks, and state size (it grows silently until the job falls over).</p>
+
+      <h2>4. The data itself</h2>
+
+      <p>Everything so far tells you whether the machinery works. None of it tells you whether the output is correct. A job can run in record time and write an empty table. An upstream team can rename a column, and your <code>COALESCE</code> quietly turns every value into zero. That's why data checks are their own layer.</p>
+
+      <p>I group data checks into five kinds. If you only add one, add freshness.</p>
+
+      <h3>Freshness</h3>
+
+      <p>How old is the newest data in the table? This is the simplest, most valuable check there is, and it catches failures from every layer below: crashed jobs, stuck schedulers, an upstream source that stopped sending, a stream that's lagging.</p>
+
+<pre><code>-- Minutes since the most recent event landed.
+SELECT
+  EXTRACT(EPOCH FROM (now() - max(ingested_at))) / 60 AS minutes_stale
+FROM silver.orders;
+
+-- Alert if minutes_stale &gt; 90 for an hourly table.</code></pre>
+
+      <p>Measure freshness on the column that tracks when data <em>arrived</em> (<code>ingested_at</code>), and separately on the business timestamp (<code>event_time</code>) if you care about source delays. And run the check from outside the pipeline, on its own schedule. A freshness check that runs as the last step of the pipeline never runs when the pipeline doesn't.</p>
+
+      <h3>Volume</h3>
+
+      <p>Did roughly the expected number of rows arrive? Zero rows is the obvious case. The harder cases are 40% fewer rows than usual (one source partition missing), or twice as many (a duplicated load).</p>
+
+      <p>Fixed thresholds don't work well because volume has seasonality: weekends are quieter, month-end is busier. Compare with the same weekday over the last few weeks instead:</p>
+
+<pre><code>WITH daily AS (
+  SELECT event_date, count(*) AS n
+  FROM silver.orders
+  WHERE event_date &gt;= current_date - 29
+  GROUP BY event_date
+),
+baseline AS (
+  SELECT avg(n) AS mean_n, stddev(n) AS sd_n
+  FROM daily
+  WHERE extract(dow FROM event_date) = extract(dow FROM current_date - 1)
+    AND event_date &lt; current_date - 1
+)
+SELECT d.n, b.mean_n,
+       (d.n - b.mean_n) / nullif(b.sd_n, 0) AS z_score
+FROM daily d CROSS JOIN baseline b
+WHERE d.event_date = current_date - 1;
+
+-- Alert if |z_score| &gt; 3, or if n = 0.</code></pre>
+
+      <h3>Schema</h3>
+
+      <p>Columns added, removed, renamed, or changing type. Some formats and table layers handle additions gracefully, but a removed or renamed column usually turns into a column full of nulls downstream, which no job will complain about. Compare the incoming schema to the expected one (ideally from a data contract) and fail the load or at least alert on any difference.</p>
+
+      <h3>Quality rules</h3>
+
+      <p>These are assertions about the values, usually declared next to the table. Most tools (dbt tests, Great Expectations, Soda, Databricks expectations, Deequ) give you the same core set:</p>
+
+      <ul>
+        <li><strong>Not null</strong> on keys and required fields, or a maximum null rate ("<code>email</code> is null in less than 2% of rows").</li>
+        <li><strong>Uniqueness</strong> of primary keys. Duplicates are the most common silent bug in incremental loads.</li>
+        <li><strong>Accepted values and ranges:</strong> <code>status</code> in a known set, <code>amount &gt;= 0</code>, dates not in the future.</li>
+        <li><strong>Referential integrity:</strong> every <code>orders.customer_id</code> exists in <code>customers</code>.</li>
+        <li><strong>Business rules:</strong> the sum of line items equals the order total, a refund never exceeds its payment.</li>
+      </ul>
+
+<pre><code>-- A few checks as plain SQL. Each returns the number of bad rows; 0 is a pass.
+SELECT count(*) FROM silver.orders WHERE order_id IS NULL;
+
+SELECT count(*) FROM (
+  SELECT order_id FROM silver.orders GROUP BY order_id HAVING count(*) &gt; 1
+) dup;
+
+SELECT count(*) FROM silver.orders WHERE amount &lt; 0 OR status NOT IN ('new', 'paid', 'cancelled');
+
+SELECT count(*) FROM silver.orders o
+LEFT JOIN silver.customers c ON o.customer_id = c.customer_id
+WHERE c.customer_id IS NULL;</code></pre>
+
+      <p>Decide per rule whether a failure should <strong>block</strong> the pipeline (don't publish bad data to gold, keep yesterday's version) or just <strong>warn</strong> (publish, but tell someone). Duplicate primary keys in a financial table: block. A slightly higher null rate on an optional field: warn. When you block, quarantine the bad rows somewhere you can inspect them instead of dropping them.</p>
+
+      <h3>Distribution</h3>
+
+      <p>The subtlest kind. Every rule passes, but the data has shifted: average order value halved overnight, one country disappeared from the mix, a categorical column suddenly has 80% "unknown". Track a few summary stats per important column (mean, percentiles, null rate, distinct count, top values) and alert when they move far from their recent history. This is where most of the "data observability" products earn their money, but you can get a long way with a daily stats table and the same z-score trick as above.</p>
+
+      <h2>5. Row counts at every step</h2>
+
+      <p>This is the habit I'd recommend most to anyone building pipelines. At every step, log how many rows came in, how many went out, and how many were dropped and why. Write those numbers to an audit table, not just to the logs.</p>
+
+      <p>Once you have it, a lot of questions become a single query. "Did we lose data?" turns into: does every row that came in end up either in the output or in a reject bucket with a reason?</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Step</th><th>Rows in</th><th>Rows out</th><th>Rejected</th><th>Note</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>source → raw</td><td>1,000,000</td><td>1,000,000</td><td>0</td><td>Should always match the source export count</td></tr>
+            <tr><td>raw → bronze</td><td>1,000,000</td><td>998,700</td><td>1,300</td><td>Unparseable JSON, sent to quarantine</td></tr>
+            <tr><td>bronze → silver</td><td>998,700</td><td>991,200</td><td>0</td><td>7,500 duplicates removed by the merge</td></tr>
+            <tr><td>silver → gold</td><td>991,200</td><td>412</td><td>0</td><td>Aggregated per store per day</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Each line has an invariant you can check automatically: <code>rows_in = rows_out + rejected + deduplicated</code>. If it doesn't hold, rows went missing somewhere they shouldn't, and you know exactly which step. For aggregations the row count changes by design, so reconcile a total instead (the sum of <code>amount</code> in gold equals the sum in silver).</p>
+
+      <p>A small helper is enough. Something like:</p>
+
+<pre><code>from datetime import datetime, timezone
+
+class RowCountMismatch(Exception):
+    pass
+
+def record_step(spark, *, run_id, pipeline, step, rows_in, rows_out,
+                rejected=0, deduplicated=0):
+    spark.createDataFrame([{
+        "run_id": run_id,
+        "pipeline": pipeline,
+        "step": step,
+        "rows_in": rows_in,
+        "rows_out": rows_out,
+        "rejected": rejected,
+        "deduplicated": deduplicated,
+        "recorded_at": datetime.now(timezone.utc),
+    }]).write.mode("append").saveAsTable("ops.pipeline_audit")
+
+    lost = rows_in - rows_out - rejected - deduplicated
+    if lost != 0:
+        raise RowCountMismatch(f"{pipeline}.{step}: {lost} rows unaccounted for")</code></pre>
+
+      <p>Two practical notes. Counting a Spark DataFrame triggers a full computation, so cache it first or read the counts from the write metrics (Delta and Iceberg both report rows written in their commit metadata). And always compare the very first number against the source system's own count when you can: the export file's trailer, the API's <code>total</code> field, a <code>count(*)</code> on the source database. If the source says 1,000,000 and raw says 1,000,000, you know the ingestion is complete, which no amount of internal checking can tell you.</p>
+
+      <p>The audit table also becomes your volume history for free, and the source of the volume check from the previous section.</p>
+
+      <h2>6. Logging</h2>
+
+      <p>Metrics tell you something is wrong; logs tell you what. A few rules make pipeline logs much more useful:</p>
+
+      <ul>
+        <li><strong>Structured logs</strong> (JSON), not free text, so you can filter and aggregate.</li>
+        <li><strong>The same identifiers on every line:</strong> <code>pipeline</code>, <code>run_id</code>, <code>step</code>, the partition or batch being processed. With those, "show me everything that happened to yesterday's orders load" is one search across every system it touched.</li>
+        <li><strong>Log the counts</strong> from the previous section at each step, in addition to writing them to the audit table.</li>
+        <li><strong>Log decisions, not just errors:</strong> "skipped partition 2026-10-18, already loaded", "schema has a new column <code>discount_code</code>, added as nullable". These are the lines you need during an incident.</li>
+        <li><strong>Never log row contents</strong> with personal data. Log keys or hashes.</li>
+      </ul>
+
+<pre><code>{"ts": "2026-10-19T06:12:03Z", "level": "INFO", "pipeline": "orders",
+ "run_id": "scheduled__2026-10-19T05:00", "step": "raw_to_bronze",
+ "partition": "ingest_date=2026-10-19", "rows_in": 1000000,
+ "rows_out": 998700, "rejected": 1300, "duration_s": 184}</code></pre>
+
+      <h2>7. Other things worth watching</h2>
+
+      <ul>
+        <li><strong>Cost.</strong> Spend per pipeline per day, bytes scanned per query. A cost jump is often the first visible sign of a bug, like a lost partition filter that makes a job scan the whole table.</li>
+        <li><strong>Lineage.</strong> When a table is wrong, you want to know which upstream tables and jobs fed it, and which downstream consumers are affected. OpenLineage and catalog tools give you this graph; even a hand-maintained list of "who reads this table" helps decide how loud an alert should be.</li>
+        <li><strong>Table health.</strong> For lakehouse tables: number of small files, number of snapshots, time since last compaction. These degrade slowly and then make every query slow.</li>
+        <li><strong>Access and security.</strong> Failed authentication against sources, credentials about to expire. An expired token is a very common reason for a 3 a.m. failure that was entirely predictable.</li>
+        <li><strong>Dependencies.</strong> Upstream APIs' error rates and latency, upstream tables' freshness. Your pipeline is only as fresh as its slowest input.</li>
+      </ul>
+
+      <h2>8. Turning signals into alerts</h2>
+
+      <p>Collecting all of the above is the easy part. Deciding what deserves a human's attention is where monitoring setups usually go wrong, most often by alerting on everything until people mute the channel.</p>
+
+      <p>The rules I try to follow:</p>
+
+      <ul>
+        <li><strong>Page on symptoms consumers feel, not on causes.</strong> "The revenue table is 2 hours stale" is a page. "CPU is at 95%" is not; if it matters, it will show up as staleness.</li>
+        <li><strong>Every alert needs an action.</strong> If the honest response to an alert is "look at it and do nothing", delete the alert or turn it into a dashboard panel.</li>
+        <li><strong>Every alert needs a runbook link</strong> and enough context in the message to start: which pipeline, which run, which partition, link to logs, who owns it.</li>
+        <li><strong>Use <code>for:</code> durations</strong> so that a single bad scrape doesn't page anyone.</li>
+        <li><strong>Group and deduplicate.</strong> One upstream failure shouldn't produce fifty alerts; route by pipeline and inhibit downstream alerts while the upstream one is firing.</li>
+        <li><strong>Monitor the monitoring.</strong> If the scheduler dies, nothing fails, so nothing alerts. Use a dead man's switch: a heartbeat the pipeline sends on every successful run, and an external service that alerts when the heartbeat <em>stops</em>. Freshness checks running outside the pipeline do the same job for data.</li>
+      </ul>
+
+      <p>I use three severity levels:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Severity</th><th>Who / how</th><th>Examples</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Page</td><td>On-call, immediately, any hour</td><td>Critical table stale beyond its SLA, primary key duplicates in a financial table, stream lag over 10 minutes and growing, zero rows loaded, disk full within the hour</td></tr>
+            <tr><td>Ticket</td><td>Owning team, next working day</td><td>Non-critical job failed after retries, volume anomaly within tolerance, quality warning rules failing, repeated OOM kills, schema change detected</td></tr>
+            <tr><td>Digest</td><td>Weekly or daily summary, nobody is interrupted</td><td>Tasks needing retries, jobs getting slower week over week, cost trends, tables needing compaction, credentials expiring this month</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Whether a given check is a page or a ticket depends less on the check and more on the table. The same freshness check is a page for the table feeding the billing system and a ticket for an exploratory dataset. That's why I like having an owner and a criticality level on every table, so routing comes from the table's metadata instead of being hard-coded in every alert.</p>
+
+      <h2>9. Dashboards</h2>
+
+      <p>Alerts tell you to look; dashboards are where you look. I keep one overview page and one page per pipeline.</p>
+
+      <ul>
+        <li><strong>Overview:</strong> every pipeline as a row, with last run status, freshness vs. SLA, and an open-alert count. The question it answers is "is everything OK right now?" in five seconds.</li>
+        <li><strong>Per pipeline:</strong> run duration over time, retry count, rows per step from the audit table, quality check results, and, for streaming jobs, lag, throughput in vs. out, and backpressure per operator. The infra panels for the cluster it runs on go at the bottom, for when you need to dig.</li>
+      </ul>
+
+      <p>Put the data panels at the top. If the freshness and volume panels look normal, you can usually stop scrolling.</p>
+
+      <h2>A checklist to start with</h2>
+
+      <p>If you're starting from nothing, this is the order I'd add things in. Each step catches a whole class of problems that the previous ones miss.</p>
+
+      <ol>
+        <li>Failure alerts with retries, timeouts, and a link to the logs.</li>
+        <li>Freshness checks on every table someone depends on, run from outside the pipeline.</li>
+        <li>Row counts per step in an audit table, with the reconciliation invariant.</li>
+        <li>Volume anomaly checks, using that audit table as history.</li>
+        <li>Primary key uniqueness and not-null checks on keys.</li>
+        <li>Consumer lag in seconds, and backpressure, for every streaming job.</li>
+        <li>Duration tracking and deadline alerts for the pipelines with an SLA.</li>
+        <li>Infra saturation alerts: disk filling up, OOM kills, sustained throttling.</li>
+        <li>Schema, distribution, and business-rule checks on the most critical tables.</li>
+        <li>A heartbeat so you know the monitoring itself is alive.</li>
+      </ol>
+
+      <p>None of this is exotic, and you don't need a dedicated observability product to do most of it. What you need is to stop treating "the job succeeded" as the definition of done, and to start asking the data itself whether it's right.</p>
+    </div>
+
+    <a class="back" href="/">Back home</a>
+
+  </article>
+</main>
+
+<footer class="site-foot">
+  <span>Firas Bouzazi</span>
+  <span class="spacer"></span>
+  <a href="https://github.com/firasbouzazi">GitHub</a>
+  <a href="https://www.linkedin.com/in/firas-bouzazi/">LinkedIn</a>
+  <a href="mailto:firas.bouzazi@imt-atlantique.net">Email</a>
+</footer>
+
+<script src="../theme.js"></script>
+</body>
+</html>
